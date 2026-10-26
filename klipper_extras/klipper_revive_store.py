@@ -129,6 +129,16 @@ class CheckpointWriter:
                     return
                 continue
             try:
+                # File identity is read in this worker, NEVER in the reactor.
+                # Copy rather than mutating the submitted snapshot.
+                if payload.get('status') == 'printing':
+                    payload = dict(payload)
+                    job = dict(payload['file'])
+                    st = os.stat(job['path'])
+                    if st.st_size != job['size']:
+                        raise ValueError('G-code source file size changed')
+                    job['mtime_ns'] = st.st_mtime_ns
+                    payload['file'] = job
                 next_seq = self.sequence + 1
                 self.store.write(next_seq, payload)
                 self.sequence = next_seq

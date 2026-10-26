@@ -16,6 +16,6 @@ jobs:
       - name: Syntax and compile checks
         run: |
           bash -n install.sh uninstall.sh
-          python3 -m py_compile scripts/setup.py klipper_extras/klipper_revive.py
+          python3 -m py_compile scripts/setup.py klipper_extras/*.py
       - name: Installation and idempotency tests
         run: python3 -m unittest discover -s tests -v
