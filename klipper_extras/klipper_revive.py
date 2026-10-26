@@ -1,7 +1,6 @@
-"""Klipper Revive: low-overhead checkpoint monitor (experimental).
+"""Klipper Revive: low-overhead checkpointing and attended recovery.
 
-Only reads existing Klipper objects. No motion commands and no automatic
-recovery actions exist in this milestone.
+No motion occurs without an explicit user-issued recovery command.
 """
 import logging
 import os
@@ -28,6 +27,21 @@ class KlipperRevive:
         self.next_checkpoint = 0.
         self.enabled = True
         self.closed_job = False
+        self.recovery = RecoverySession(
+            self,
+            z_hop=config.getfloat('recovery_z_hop', 10., above=0.),
+            xy_speed=config.getfloat('recovery_xy_speed', 60., above=0.),
+            z_speed=config.getfloat('recovery_z_speed', 2., above=0.),
+            max_xy_adjust=config.getfloat('max_xy_adjust', 5., above=0.),
+            max_z_adjust=config.getfloat('max_z_adjust', 2., above=0.))
+        self.gcode.register_command('KLIPPER_REVIVE_RECOVER', self.cmd_recover,
+                                    desc='Begin attended heated XY/Z recovery')
+        self.gcode.register_command('KLIPPER_REVIVE_XY_ADJUST', self.cmd_xy_adjust)
+        self.gcode.register_command('KLIPPER_REVIVE_CONFIRM_XY', self.cmd_confirm_xy)
+        self.gcode.register_command('KLIPPER_REVIVE_Z_ADJUST', self.cmd_z_adjust)
+        self.gcode.register_command('KLIPPER_REVIVE_CONFIRM_Z', self.cmd_confirm_z)
+        self.gcode.register_command('KLIPPER_REVIVE_RESUME', self.cmd_resume)
+        self.gcode.register_command('KLIPPER_REVIVE_CANCEL', self.cmd_cancel)
         self.gcode.register_command('KLIPPER_REVIVE_STATUS', self.cmd_status,
                                     desc='Show Klipper Revive checkpoint status')
         self.gcode.register_command('KLIPPER_REVIVE_INSPECT', self.cmd_inspect,

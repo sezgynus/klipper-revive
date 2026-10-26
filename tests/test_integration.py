@@ -129,6 +129,19 @@ class SmokeTest(unittest.TestCase):
         self.module = KlipperRevive(Config(self.printer, self.directory))
         self.printer.callbacks['klippy:ready']()
 
+    def test_recovery_commands_registered_without_motion(self):
+        commands = self.printer.gcode.commands
+        expected = (
+            'KLIPPER_REVIVE_STATUS', 'KLIPPER_REVIVE_INSPECT',
+            'KLIPPER_REVIVE_VALIDATE', 'KLIPPER_REVIVE_RECOVER',
+            'KLIPPER_REVIVE_XY_ADJUST', 'KLIPPER_REVIVE_CONFIRM_XY',
+            'KLIPPER_REVIVE_Z_ADJUST', 'KLIPPER_REVIVE_CONFIRM_Z',
+            'KLIPPER_REVIVE_RESUME', 'KLIPPER_REVIVE_CANCEL')
+        for name in expected:
+            self.assertIn(name, commands)
+        self.assertEqual(self.module.recovery.phase, 'inactive')
+        self.printer.callbacks['klippy:shutdown']()
+
     def wait_for(self, sequence):
         until = time.monotonic() + 5
         while time.monotonic() < until:
