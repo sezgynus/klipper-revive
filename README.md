@@ -1,6 +1,6 @@
 # Klipper Revive
 
-**Klipper Revive** is a Klipper extension under development for recovering interrupted prints. This milestone provides the installer, a **read-only low-overhead checkpoint monitor**, and recovery checkpoint validation. It does **not** move the toolhead or resume interrupted prints yet.
+**Klipper Revive** is a Klipper extension under development for recovering interrupted prints. This milestone provides automatic installation, low-overhead checkpointing, and **experimental, attended recovery** on Cartesian and CoreXY printers. A user must explicitly initiate and confirm every alignment stage. Never leave a recovery unattended.
 
 ## Install (standard MainsailOS / Fluidd / KIAUH layout)
 
@@ -19,7 +19,7 @@ curl -fsSL https://raw.githubusercontent.com/sezgynus/klipper-revive/main/instal
 
 The installer:
 
-1. Links three Python modules (`klipper_revive.py`, `klipper_revive_collect.py`, `klipper_revive_store.py`) into Klipper's `klippy/extras` directory (no copies).
+1. Links four Python modules (`klipper_revive.py`, `klipper_revive_collect.py`, `klipper_revive_store.py`, `klipper_revive_recovery.py`) into Klipper's `klippy/extras` directory (no copies).
 2. Creates a managed `klipper_revive.cfg` alongside `printer.cfg` containing `[klipper_revive]`.
 3. Adds `[include klipper_revive.cfg]` to `printer.cfg` if missing.
 4. Creates a managed `klipper_revive_update.cfg` alongside `moonraker.conf`.
@@ -28,7 +28,7 @@ The installer:
 
 No `SAVE_VARIABLE`, extra Python package, or dedicated service is installed. A single daemon writer thread is activated **only when there is a checkpoint to write**. A symlink stays valid when Moonraker updates repository contents. **Do not edit tracked files in the Git checkout**; Moonraker requires a clean repo to update.
 
-The module offers `KLIPPER_REVIVE_STATUS`, `KLIPPER_REVIVE_INSPECT`, and `KLIPPER_REVIVE_VALIDATE`. Sampling uses a 1-second lightweight state timer, with checkpoint writes at most every 15 seconds by default when progress changes. A bounded two-slot checkpoint store keeps the last valid checkpoint with a SHA-256 digest and atomic replacement. All `stat`, serialization, and disk flush operations run in a worker thread. No toolhead motion or print recovery is attempted in this version.
+The module offers `KLIPPER_REVIVE_STATUS`, `KLIPPER_REVIVE_INSPECT`, `KLIPPER_REVIVE_VALIDATE` and the explicit recovery commands described below. Sampling uses a 1-second lightweight state timer, with checkpoint writes at most every 15 seconds by default when progress changes. A bounded two-slot checkpoint store keeps the last valid checkpoint with a SHA-256 digest and atomic replacement. All `stat`, serialization, and disk flush operations run in a worker thread. Normal printing never causes recovery motion. Physical recovery movement occurs only when the user sends recovery commands.
 
 ### Custom installations
 
@@ -64,7 +64,7 @@ KLIPPER_REVIVE_INSPECT
 
 After 15–20 seconds of movement, `checkpoint=True` and `seq>=1` should be reported (exact timing depends on the first sample). The file and byte position should advance over later samples. Check the on-disk files in `~/printer_data/klipper_revive/checkpoint.[01].json`.
 
-After stopping the test print **normally**, the checkpoint is invalidated (a completion/cancellation tombstone). To test preservation on a true interruption, use only a disposable test print: a Klipper RESTART/shutdown before normal completion should leave the last valid checkpoint on disk. On return, `KLIPPER_REVIVE_INSPECT` should show it, and `KLIPPER_REVIVE_VALIDATE` should verify its original G-code file. **Do not trigger a power outage, force an MCU shutdown, or rely on physical recovery during this milestone.**
+After stopping the test print **normally**, the checkpoint is invalidated (a completion/cancellation tombstone). To test preservation on a true interruption, use only a disposable test print: a Klipper RESTART/shutdown before normal completion should leave the last valid checkpoint on disk. On return, `KLIPPER_REVIVE_INSPECT` should show it, and `KLIPPER_REVIVE_VALIDATE` should verify its original G-code file. **Do not trigger an uncontrolled power outage or deliberate MCU failure for testing.** Use a disposable print and intentional software restart only after confirming this test will not damage hardware.
 
 Configuration options in `klipper_revive.cfg`:
 
@@ -76,6 +76,57 @@ Configuration options in `klipper_revive.cfg`:
 ```
 
 Read the live module status using Moonraker's `klipper_revive` status object as well. The saved file path and modified time are validated on explicit request; inspection does not move any motors or change heaters.
+
+### Experimental recovery wizard (supervised test only)
+
+Recovery is **opt-in**: it never begins after boot by itself. After a failed print, ensure the hotend is in a safe position and axes can move. The saved machine Z is trusted *without Z homing*; this is valid only if Z has not mechanically shifted since the last checkpoint. If Z motors lost steps or the gantry moved, **do not start recovery**.
+
+1. Inspect the checkpoint and verify that its file matches the actual print:
+
+   ```gcode
+   KLIPPER_REVIVE_STATUS
+   KLIPPER_REVIVE_INSPECT
+   KLIPPER_REVIVE_VALIDATE
+   ```
+
+2. With an operator watching, issue `KLIPPER_REVIVE_RECOVER`. It waits for saved bed/hotend temperatures, assigns the saved machine Z **without physical movement**, lifts Z by the configured 10 mm, homes XY, then moves to the saved XY point at the lifted height. There is no automatic resume.
+3. With the nozzle still 10 mm above the printed surface, adjust and approve XY:
+
+   ```gcode
+   KLIPPER_REVIVE_XY_ADJUST X=0.1
+   KLIPPER_REVIVE_XY_ADJUST Y=-0.1
+   KLIPPER_REVIVE_CONFIRM_XY
+   ```
+
+4. `CONFIRM_XY` makes a slow Z approach to the checkpoint machine height (default 2 mm/s). If necessary make small Z adjustments, then approve Z:
+
+   ```gcode
+   KLIPPER_REVIVE_Z_ADJUST Z=0.05
+   KLIPPER_REVIVE_CONFIRM_Z
+   ```
+
+5. **Verify the externally selected filament/tool and any third-party plugin state yourself**. Third-party internal state cannot be reconstructed automatically. Confirm only when safe:
+
+   ```gcode
+   KLIPPER_REVIVE_RESUME EXTERNAL_STATE_OK=1
+   ```
+
+This restores standard captured coordinate/extrusion modes, speeds, bed mesh **only if a named persisted profile is available**, regular/generic fan speeds, saved active extruder and bed/nozzle targets. It selects the same G-code file and seeks the recorded byte position using Klipper's existing virtual SD functionality. The next queued G-code may repeat part of an already printed segment.
+
+At any alignment stage `KLIPPER_REVIVE_CANCEL` stops the wizard **without movement**. Since Klipper's Z reference was manually assigned, restart Klipper before normal printing after cancellation. If the actual nozzle seems lower than expected, do not confirm or jog downward.
+
+Default recovery config (add options to `klipper_revive.cfg`):
+
+```ini
+[klipper_revive]
+# recovery_z_hop: 10
+# recovery_xy_speed: 60
+# recovery_z_speed: 2
+# max_xy_adjust: 5
+# max_z_adjust: 2
+```
+
+**Limitations:** Cartesian/CoreXY only, no automatic XY/Z collision detection, no verification of hidden states owned by third-party MMU/toolchanger plugins, and no automatic reconstruction of temporary adaptive meshes that have no persisted profile. Printer-specific `G28` macros and homing overrides may move additional axes; check their behavior before using this experimental wizard.
 
 ### Updating
 
@@ -93,7 +144,7 @@ Accepts the same path and `--no-restart` flags. Removes only its owned symlink, 
 
 ## Safety and development
 
-This milestone **records checkpoints but does not resume prints**. Do not rely on it to protect prints yet. Live recovery will be implemented separately with human confirmation for XY/Z alignment.
+**Early experimental version — not yet hardware-validated.** A recovery may damage a print or toolhead if physical Z changed during power loss, the saved motion state is ahead of actual movement, or custom homing/macros act differently. Test only on supervised, disposable prints at low speeds; do not depend on this to save valuable prints.
 
 Local checks:
 

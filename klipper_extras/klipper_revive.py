@@ -8,6 +8,7 @@ import os
 
 from .klipper_revive_collect import StateCollector
 from .klipper_revive_store import CheckpointStore, CheckpointWriter
+from .klipper_revive_recovery import RecoverySession, RecoveryError
 
 
 class KlipperRevive:
@@ -91,14 +92,17 @@ class KlipperRevive:
             'file': checkpoint.get('file', {}).get('path', '') if checkpoint else '',
             'sequence': self.writer.sequence,
             'storage_error': self.writer.last_error or '',
+            'recovery_phase': self.recovery.phase,
+            'recovery_offsets': tuple(self.recovery.offsets),
         }
 
     def cmd_status(self, gcmd):
         s = self.get_status(self.reactor.monotonic())
         gcmd.respond_info(
-            'Klipper Revive: enabled=%s checkpoint=%s seq=%d pos=%d storage_error=%s'
+            'Klipper Revive: enabled=%s checkpoint=%s seq=%d pos=%d recovery=%s offsets=%s storage_error=%s'
             % (s['enabled'], s['checkpoint_available'], s['sequence'],
-               s['file_position'], s['storage_error'] or 'none'))
+               s['file_position'], s['recovery_phase'], s['recovery_offsets'],
+               s['storage_error'] or 'none'))
 
     def cmd_inspect(self, gcmd):
         snapshot = self.writer.last_saved
@@ -111,6 +115,46 @@ class KlipperRevive:
             % (snapshot['file']['path'], snapshot['file_position'],
                snapshot['machine_position'][:3], snapshot['extruder'],
                snapshot['heater_targets'], snapshot.get('mesh_profile', '')))
+
+    def _recover_call(self, gcmd, action):
+        try:
+            action()
+        except RecoveryError as exc:
+            raise gcmd.error(str(exc))
+
+    def cmd_recover(self, gcmd):
+        self._recover_call(gcmd, self.recovery.prepare)
+        gcmd.respond_info('Revive: at XY alignment, adjust or confirm XY.')
+
+    def cmd_xy_adjust(self, gcmd):
+        dx = gcmd.get_float('X', 0.)
+        dy = gcmd.get_float('Y', 0.)
+        self._recover_call(gcmd, lambda: self.recovery.adjust_xy(dx, dy))
+        gcmd.respond_info('Revive XY offsets: %s' % self.recovery.offsets[:2])
+
+    def cmd_confirm_xy(self, gcmd):
+        self._recover_call(gcmd, self.recovery.confirm_xy)
+        gcmd.respond_info('Revive: at Z alignment; adjust or confirm Z.')
+
+    def cmd_z_adjust(self, gcmd):
+        dz = gcmd.get_float('Z', 0.)
+        self._recover_call(gcmd, lambda: self.recovery.adjust_z(dz))
+        gcmd.respond_info('Revive Z offset: %.3f mm' % self.recovery.offsets[2])
+
+    def cmd_confirm_z(self, gcmd):
+        self._recover_call(gcmd, self.recovery.confirm_z)
+        gcmd.respond_info('Revive: position confirmed. Check external filament/tool state.'
+                          ' KLIPPER_REVIVE_RESUME EXTERNAL_STATE_OK=1 to continue.')
+
+    def cmd_resume(self, gcmd):
+        acknowledge = gcmd.get_int('EXTERNAL_STATE_OK', 0, minval=0, maxval=1)
+        self._recover_call(gcmd, lambda: self.recovery.resume(acknowledge == 1))
+        gcmd.respond_info('Revive: resumed virtual SD print.')
+
+    def cmd_cancel(self, gcmd):
+        self.recovery.cancel()
+        gcmd.respond_info('Revive: cancelled. RESTART Klipper before normal operation'
+                          ' to clear the temporary Z reference.')
 
     def validate_checkpoint(self):
         """Intended for explicit, idle-time inspection only."""
