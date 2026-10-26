@@ -1,0 +1,21 @@
+name: Installer Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  installer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax and compile checks
+        run: |
+          bash -n install.sh uninstall.sh
+          python3 -m py_compile scripts/setup.py klipper_extras/klipper_revive.py
+      - name: Installation and idempotency tests
+        run: python3 -m unittest discover -s tests -v
