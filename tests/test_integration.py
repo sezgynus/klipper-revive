@@ -134,6 +134,113 @@ class SmokeTest(unittest.TestCase):
         self.module = KlipperRevive(Config(self.printer, self.directory))
         self.printer.callbacks['klippy:ready']()
 
+    def wait_until(self, predicate):
+        until = time.monotonic() + 5
+        while time.monotonic() < until:
+            if predicate():
+                return
+            time.sleep(.01)
+        self.fail('checkpoint state did not reach expected value')
+
+    def test_same_file_new_print_hides_previous_checkpoint_immediately(self):
+        # M27 for a new print can be at byte 20 while an old same-file
+        # checkpoint is at byte 100. That old state must never be offered.
+        timer = self.printer.reactor.callback
+        timer(1.)
+        self.wait_for(1)
+        previous = self.module._recoverable_checkpoint()
+        self.assertEqual(previous['file_position'], 100)
+
+        sd = self.printer.objects['virtual_sdcard']
+        self.printer.stats.state = 'standby'
+        sd.file_position = 0
+        self.printer.callbacks['virtual_sdcard:reset_file']()
+        self.assertIsNone(self.module._recoverable_checkpoint())
+        status = self.module.get_status(2.)
+        self.assertFalse(status['checkpoint_available'])
+        self.assertEqual(status['file_position'], 0)
+        self.assertEqual(self.module.validate_checkpoint()[0], False)
+        messages = []
+        self.module.cmd_inspect(SimpleNamespace(respond_info=messages.append))
+        self.assertEqual(messages, ['Klipper Revive: no recoverable checkpoint'])
+
+        # Invalidation is durable before the next checkpoint is available.
+        self.wait_until(lambda: CheckpointStore(self.directory).load()[1]
+                        .get('status') == 'invalidated')
+        sd.file_position = 20
+        self.printer.stats.state = 'printing'
+        timer(3.)
+        self.wait_until(lambda: self.module._recoverable_checkpoint() is not None)
+        current = self.module._recoverable_checkpoint()
+        self.assertEqual(current['file_position'], 20)
+        self.assertNotEqual(previous['job_id'], current['job_id'])
+        self.assertEqual(self.module.get_status(3.)['file_position'], 20)
+        self.printer.callbacks['klippy:shutdown']()
+
+    def test_interrupted_checkpoint_survives_restart_until_next_job(self):
+        # A Klippy restart by itself is not a fresh print. A previously
+        # interrupted checkpoint remains available until file selection.
+        timer = self.printer.reactor.callback
+        timer(1.)
+        self.wait_for(1)
+        old = self.module._recoverable_checkpoint()
+        self.printer.callbacks['klippy:shutdown']()
+        self.module.writer._thread.join(3)
+
+        self.printer.stats.state = 'standby'
+        replacement = KlipperRevive(Config(self.printer, self.directory))
+        self.module = replacement
+        self.printer.callbacks['klippy:ready']()
+        self.assertEqual(replacement._recoverable_checkpoint(), old)
+        self.assertTrue(replacement.get_status(0)['checkpoint_available'])
+
+        # Same G-code selected for printing again, without completing
+        # a recovery session: it is an entirely new print.
+        self.printer.callbacks['virtual_sdcard:reset_file']()
+        self.assertFalse(replacement.get_status(0)['checkpoint_available'])
+        self.assertFalse(replacement.validate_checkpoint()[0])
+        self.wait_until(lambda: CheckpointStore(self.directory).load()[1]
+                        .get('status') == 'invalidated')
+        self.printer.callbacks['klippy:shutdown']()
+
+    def test_repeated_file_reset_creates_distinct_sessions(self):
+        self.printer.stats.state = 'standby'
+        ids = []
+        for _ in range(2):
+            self.printer.callbacks['virtual_sdcard:reset_file']()
+            ids.append(self.module._session_id)
+            self.assertFalse(self.module.get_status(0)['checkpoint_available'])
+        self.assertNotEqual(ids[0], ids[1])
+        self.wait_until(lambda: CheckpointStore(self.directory).load()[1]
+                        .get('job_id') == ids[-1])
+        self.assertEqual(CheckpointStore(self.directory).load()[1]['status'],
+                         'invalidated')
+        self.printer.callbacks['klippy:shutdown']()
+
+    def test_legacy_checkpoint_hides_on_new_job_and_allows_new_lower_offset(self):
+        # Pre-session checkpoint from an older Klipper Revive build.
+        self.printer.callbacks['klippy:shutdown']()
+        legacy = {'schema': 1, 'status': 'printing',
+                  'file': {'path': self.printer.objects['virtual_sdcard'].file,
+                           'size': self.printer.objects['virtual_sdcard'].file_size},
+                  'file_position': 500}
+        CheckpointStore(self.directory).write(1, legacy)
+        self.printer.stats.state = 'standby'
+        self.module = KlipperRevive(Config(self.printer, self.directory))
+        self.printer.callbacks['klippy:ready']()
+        self.assertEqual(self.module._recoverable_checkpoint(), legacy)
+        self.printer.callbacks['virtual_sdcard:reset_file']()
+        self.assertIsNone(self.module._recoverable_checkpoint())
+        self.wait_until(lambda: CheckpointStore(self.directory).load()[1]
+                        .get('status') == 'invalidated')
+        sd = self.printer.objects['virtual_sdcard']
+        sd.file_position = 45
+        self.printer.stats.state = 'printing'
+        self.printer.reactor.callback(1.)
+        self.wait_until(lambda: self.module._recoverable_checkpoint() is not None)
+        self.assertEqual(self.module.get_status(1.)['file_position'], 45)
+        self.printer.callbacks['klippy:shutdown']()
+
     def test_completed_sd_lines_checkpoint_during_timer_starvation(self):
         # Reproduces real Klipper: SD file_position advances only *after*
         # gcode.run_script returns, while reactor timers mostly run inside

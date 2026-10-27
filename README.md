@@ -102,6 +102,18 @@ KLIPPER_REVIVE_INSPECT
 
 After 15–20 seconds of movement, `checkpoint=True` and `seq>=1` should be reported (exact timing depends on the first sample). The file and byte position should advance over later samples. Compare `KLIPPER_REVIVE_STATUS` `pos` with Klipper's own `M27` SD byte position at least twice 30 seconds apart: the Revive checkpoint should advance. A nonzero lag is normal due to the 15-second interval and queued moves, but a position frozen across minutes while `M27` advances indicates failure and must be fixed **before any recovery experiment**. Check the on-disk files in `~/printer_data/klipper_revive/checkpoint.[01].json`.
 
+**New-print isolation:** selecting/resetting a virtual SD print starts a new
+checkpoint session, even if the G-code filename has not changed. An older
+checkpoint is hidden from STATUS, INSPECT, VALIDATE and attended recovery as
+soon as the new print is selected, before the first new 15-second checkpoint
+is taken. The former session is invalidated in background storage before
+the new session's checkpoints are queued. A genuine interruption followed by
+a Klipper restart does not itself invalidate the saved checkpoint; it remains
+available until a *new* file-selection/reset event. As with every asynchronous
+filesystem write, a power loss during the invalidation write may leave an
+older on-disk record; do not treat this milestone as crash-proof across
+immediate repeated power failures.
+
 After stopping the test print **normally**, the checkpoint is invalidated (a completion/cancellation tombstone). To test preservation on a true interruption, use only a disposable test print: a Klipper RESTART/shutdown before normal completion should leave the last valid checkpoint on disk. On return, `KLIPPER_REVIVE_INSPECT` should show it, and `KLIPPER_REVIVE_VALIDATE` should verify its original G-code file. **Do not trigger an uncontrolled power outage or deliberate MCU failure for testing.** Use a disposable print and intentional software restart only after confirming this test will not damage hardware.
 
 Configuration options in `klipper_revive.cfg`:

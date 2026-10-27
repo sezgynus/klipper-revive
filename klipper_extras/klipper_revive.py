@@ -4,6 +4,7 @@ No motion occurs without an explicit user-issued recovery command.
 """
 import logging
 import os
+import uuid
 
 from .klipper_revive_collect import StateCollector
 from .klipper_revive_store import CheckpointStore, CheckpointWriter
@@ -30,6 +31,9 @@ class KlipperRevive:
         self._script_depth = 0
         self.enabled = True
         self.closed_job = False
+        # None means no new job has been selected since the last Klippy boot.
+        # In that state a stored interrupted-print checkpoint remains usable.
+        self._session_id = None
         self.recovery = RecoverySession(
             self,
             z_hop=config.getfloat('recovery_z_hop', 10., above=0.),
@@ -51,6 +55,10 @@ class KlipperRevive:
                                     desc='Inspect last saved recovery checkpoint')
         self.gcode.register_command('KLIPPER_REVIVE_VALIDATE', self.cmd_validate,
                                     desc='Validate last saved checkpoint and G-code file')
+        # VirtualSD emits this immediately when loading/selecting a file,
+        # before the new print has processed any G-code.
+        self.printer.register_event_handler('virtual_sdcard:reset_file',
+                                            self._on_file_reset)
         self.printer.register_event_handler('klippy:ready', self._on_ready)
         self.printer.register_event_handler('klippy:shutdown', self._on_stop)
         self.printer.register_event_handler('klippy:disconnect', self._on_stop)
@@ -71,6 +79,37 @@ class KlipperRevive:
             self.reactor.unregister_timer(self.timer)
             self.timer = None
         self.writer.close()
+
+    def _begin_job(self, invalidate_previous=True):
+        """Fence off earlier print sessions, even for the same G-code path."""
+        self._session_id = uuid.uuid4().hex
+        self.next_checkpoint = 0.
+        self.closed_job = False
+        if invalidate_previous:
+            # This tombstone is queued *before* any new job's snapshots.
+            # Disk writes stay off the Klipper reactor thread.
+            if not self.writer.submit({
+                    'schema': 1, 'status': 'invalidated',
+                    'job_id': self._session_id}):
+                logging.error('Klipper Revive could not invalidate old checkpoint')
+                self.enabled = False
+
+    def _on_file_reset(self):
+        # SDCARD_PRINT_FILE, M23 and SDCARD_RESET_FILE reset VirtualSD.
+        # The old checkpoint must not be exposed even while the background
+        # writer is still persisting the invalidation tombstone.
+        self._begin_job()
+
+    def _recoverable_checkpoint(self):
+        checkpoint = self.writer.last_saved
+        if checkpoint is None or checkpoint.get('status') != 'printing':
+            return None
+        # A new job is in progress: any previous job's checkpoint is
+        # unavailable, irrespective of file path, size or G-code position.
+        if (self._session_id is not None
+                and checkpoint.get('job_id') != self._session_id):
+            return None
+        return checkpoint
 
     def _install_sd_completion_hook(self):
         """Observe successful file-command boundaries without modifying Klipper.
@@ -124,7 +163,14 @@ class KlipperRevive:
                                           after_sd_command=after_sd_command)
         if snapshot is None:
             return
-        previous = self.writer.last_saved
+        if self._session_id is None:
+            # Defensive fallback for nonstandard SD implementations that
+            # did not emit virtual_sdcard:reset_file.
+            self._begin_job(invalidate_previous=self.writer.last_saved is not None)
+        if not self.enabled:
+            return
+        snapshot['job_id'] = self._session_id
+        previous = self._recoverable_checkpoint()
         # Don't save the same/older byte offset, including a timer sample
         # that races with the checkpoint worker's latest pending snapshot.
         if (previous is None or previous.get('status') != 'printing'
@@ -144,7 +190,8 @@ class KlipperRevive:
                 self._capture_if_due(eventtime)
             elif state in ('complete', 'cancelled'):
                 if not self.closed_job:
-                    self.writer.submit({'schema': 1, 'status': state})
+                    self.writer.submit({'schema': 1, 'status': state,
+                                        'job_id': self._session_id})
                     self.closed_job = True
             # Keep last good checkpoint on print error/shutdown.
         except Exception:
@@ -154,11 +201,10 @@ class KlipperRevive:
         return eventtime + self.sample_interval
 
     def get_status(self, eventtime):
-        checkpoint = self.writer.last_saved
+        checkpoint = self._recoverable_checkpoint()
         return {
             'enabled': self.enabled,
-            'checkpoint_available': (checkpoint is not None
-                                     and checkpoint.get('status') == 'printing'),
+            'checkpoint_available': checkpoint is not None,
             'file_position': checkpoint.get('file_position', 0) if checkpoint else 0,
             'file': checkpoint.get('file', {}).get('path', '') if checkpoint else '',
             'sequence': self.writer.sequence,
@@ -176,8 +222,8 @@ class KlipperRevive:
                s['storage_error'] or 'none'))
 
     def cmd_inspect(self, gcmd):
-        snapshot = self.writer.last_saved
-        if not snapshot or snapshot.get('status') != 'printing':
+        snapshot = self._recoverable_checkpoint()
+        if snapshot is None:
             gcmd.respond_info('Klipper Revive: no recoverable checkpoint')
             return
         gcmd.respond_info(
@@ -229,8 +275,8 @@ class KlipperRevive:
 
     def validate_checkpoint(self):
         """Intended for explicit, idle-time inspection only."""
-        checkpoint = self.writer.last_saved
-        if not checkpoint or checkpoint.get('status') != 'printing':
+        checkpoint = self._recoverable_checkpoint()
+        if checkpoint is None:
             return False, 'No recoverable print checkpoint'
         path = checkpoint['file']['path']
         sd_dir = os.path.realpath(
