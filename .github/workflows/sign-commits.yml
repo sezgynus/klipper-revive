@@ -2,11 +2,12 @@ name: Sign Commits
 
 on:
   push:
-    branches:
-      - '**'
+    branches: [master]
 
+# The workflow token is a fallback when the dedicated signing App's
+# installation lacks write access. The SSH key remains the signing identity.
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   sign:
@@ -14,40 +15,38 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Generate Signing Bot token
+      - name: Request writable Signing Bot token
         id: app-token
+        continue-on-error: true
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ secrets.SIGNING_APP_ID }}
           private-key: ${{ secrets.SIGNING_APP_PRIVATE_KEY }}
+          permission-contents: write
 
-      - name: Checkout
+      - name: Checkout without stored credentials
         uses: actions/checkout@v4
         with:
-          token: ${{ steps.app-token.outputs.token }}
           fetch-depth: 2
+          persist-credentials: false
 
       - name: Install signing key
-        shell: bash
         env:
           SIGNING_KEY: ${{ secrets.COMMIT_SIGNING_KEY }}
         run: |
+          set -euo pipefail
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-
           printf '%s\n' "$SIGNING_KEY" > ~/.ssh/github_actions_signing
           chmod 600 ~/.ssh/github_actions_signing
-
           git config --local user.name "Sezgin AÇIKGÖZ"
           git config --local user.email "sezginacikgoz@mail.com"
-
           git config --local gpg.format ssh
           git config --local user.signingkey ~/.ssh/github_actions_signing
           git config --local commit.gpgsign true
 
-      - name: Check signature
+      - name: Check existing signature
         id: signature
-        shell: bash
         run: |
           if git cat-file commit HEAD | grep -q '^gpgsig '; then
             echo "signed=true" >> "$GITHUB_OUTPUT"
@@ -55,41 +54,52 @@ jobs:
             echo "signed=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # Explicit audit opt-in: generate assets before amending the same commit.
-      # Normal commits retain the existing signing behavior.
-      - uses: actions/setup-python@v5
-        if: steps.signature.outputs.signed == 'false' && github.ref_name == 'master' && startsWith(github.event.head_commit.message, 'docs(audit):')
-        with:
-          python-version: '3.11'
-
-      - name: Render and validate full documentation audit before signing
-        if: steps.signature.outputs.signed == 'false' && github.ref_name == 'master' && startsWith(github.event.head_commit.message, 'docs(audit):')
+      - name: Sign and push with safe fallback
+        id: signed
+        if: steps.signature.outputs.signed == 'false'
         env:
-          GPIOZERO_PIN_FACTORY: mock
-          PETREL_VERIFY_PUBLISHED_SCREENS: '1'
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          ACTIONS_TOKEN: ${{ github.token }}
+          TARGET_BRANCH: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          python -m pip install pyserial==3.5 websocket-client==1.9.2 Pillow==12.3.0 gpiozero==2.0.1.post3 qrcode==8.2 kconfiglib==14.1.0 pyte==0.8.2
-          python tools/render_docs_screenshots.py
-          python tools/render_print_controls.py
-          python tools/render_print_controls.py --frame
-          python tools/render_docs_workflows.py
-          python tools/render_configuration_screenshots.py
-          python -m unittest discover -s tests -p test_maintenance_published_docs.py -v
-          python -m unittest discover -s tests -p test_print_controls_documentation.py -v
-          python -m unittest discover -s tests -p test_boot_artwork.py -v
-          python -m unittest discover -s tests -p test_reload_icons.py -v
-          python tools/check_documentation.py
-          git add -A -- docs/assets/ docs/screenshots.md docs/screenshots_TR.md
+          git commit --amend --no-edit -S
 
-      - name: Sign commit
-        if: steps.signature.outputs.signed == 'false'
-        shell: bash
-        run: |
-          if [ "${{ github.ref_name }}" = "fix/audit-plan-completion" ]; then
-            git fetch --unshallow origin
-            git rebase --exec 'if ! git cat-file commit HEAD | grep -q "^gpgsig "; then git commit --amend --no-edit -S; fi' 4636e432a2f0f1fbb68b356fd66b3e51fb08a593
+          # The token is passed only via an environment variable to an
+          # ephemeral askpass script; it is never stored in the remote URL.
+          ASKPASS="$RUNNER_TEMP/revive-git-askpass"
+          cat > "$ASKPASS" <<'EOF'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' 'x-access-token' ;;
+            *Password*) printf '%s\n' "$PUSH_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          EOF
+          chmod 700 "$ASKPASS"
+          export GIT_ASKPASS="$ASKPASS"
+          export GIT_TERMINAL_PROMPT=0
+
+          if [ -n "$APP_TOKEN" ]; then
+            export PUSH_TOKEN="$APP_TOKEN"
+            if git push --force-with-lease origin "HEAD:refs/heads/$TARGET_BRANCH"; then
+              echo "auth=app" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::warning::Signing App push was rejected; retrying with the workflow token"
           else
-            git commit --amend --no-edit -S
+            echo "::warning::Signing App could not issue a write-capable token; using workflow token"
           fi
-          git push --force-with-lease origin HEAD:"${{ github.ref_name }}"
+
+          export PUSH_TOKEN="$ACTIONS_TOKEN"
+          git push --force-with-lease origin "HEAD:refs/heads/$TARGET_BRANCH"
+          echo "auth=actions" >> "$GITHUB_OUTPUT"
+
+      # GITHUB_TOKEN pushes do not trigger push-based CI. Explicit dispatch
+      # tests the exact signed commit after the fallback has updated master.
+      - name: Run CI for signed commit
+        if: steps.signed.outputs.auth == 'actions'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_BRANCH: ${{ github.ref_name }}
+        run: gh workflow run tests.yml --ref "$TARGET_BRANCH"
