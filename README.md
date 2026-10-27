@@ -21,7 +21,7 @@ The installer:
 
 1. Links four Python modules (`klipper_revive.py`, `klipper_revive_collect.py`, `klipper_revive_store.py`, `klipper_revive_recovery.py`) into Klipper's `klippy/extras` directory (no copies).
 2. Creates a managed `klipper_revive.cfg` alongside `printer.cfg` containing `[klipper_revive]`.
-3. Adds `[include klipper_revive.cfg]` to `printer.cfg` if missing.
+3. Adds `[include klipper_revive.cfg]` to `printer.cfg` **before Klipper's auto-generated `SAVE_CONFIG` block**. Re-running the installer repairs older installations that incorrectly placed the include below the block, without deleting stored probe calibration values.
 4. Creates a managed `klipper_revive_update.cfg` alongside `moonraker.conf`.
 5. Adds `[include klipper_revive_update.cfg]` to `moonraker.conf` if missing, registering **klipper-revive** as a Moonraker `git_repo` updater (`main`, `dev`, `managed_services: klipper`).
 6. Restarts Klipper and Moonraker **only when Moonraker confirms the printer is idle**. A printing/paused/unreachable printer is never restarted automatically.
@@ -46,6 +46,30 @@ bash ~/klipper-revive/install.sh \
 Use `--printer-config /path/to/printer.cfg` and `--moonraker-config /path/to/moonraker.conf` for independent overrides. `--no-restart` installs without restarting services. If the installer skips a restart, restart **Klipper and Moonraker only when the printer is idle**.
 
 The normal installer is idempotent. It refuses to replace existing foreign `klipper_revive.py` files or unowned configuration snippets. It preserves one-time backups when changing existing main configuration files (`.klipper-revive.bak`).
+
+### Fix a probe `z_offset` error after an older installation
+
+An earlier installer incorrectly appended `[include klipper_revive.cfg]`
+**below** the `#*# <--- SAVE_CONFIG --->` header in `printer.cfg`.
+Klipper rejects the autosave block when ordinary configuration lines appear
+there; this can make a saved `[probe] z_offset` seem to disappear.
+
+In Mainsail/Fluidd's configuration editor, move the
+`[include klipper_revive.cfg]` line **above** the `#*# SAVE_CONFIG`
+header. Do **not** change or remove any `#*#` calibration lines.
+Then issue `RESTART`.
+
+Alternatively, update your existing checkout and run the installer again:
+
+```bash
+git -C ~/klipper-revive pull --ff-only
+bash ~/klipper-revive/install.sh --no-restart
+```
+
+The installer will relocate the misplaced line safely; then `RESTART`
+Klipper from the UI. If a `z_offset` error remains, inspect the bottom of
+`printer.cfg` and its backup `printer.cfg.klipper-revive.bak` before any
+probe recalibration. Do not invent a `z_offset` value.
 
 ### Checkpoint smoke test
 

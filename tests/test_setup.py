@@ -51,6 +51,70 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse((self.moon.parent / setup.MOONRAKER_NAME).exists())
         self.assertFalse(setup.uninstall(self.p))
 
+    SAVE_CONFIG_BLOCK = (
+        "\n#*# <---------------------- SAVE_CONFIG ---------------------->\n"
+        "#*# DO NOT EDIT THIS BLOCK OR BELOW. The contents are auto-generated.\n"
+        "#*#\n"
+        "#*# [probe]\n"
+        "#*# z_offset = 1.235\n"
+        "#*#\n"
+        "#*# [bed_mesh default]\n"
+        "#*# version = 1\n"
+    )
+
+    def test_save_config_insert_before_autosave(self):
+        base = "[probe]\npin: ^PA0\n" + self.SAVE_CONFIG_BLOCK
+        self.printer.write_text(base, encoding="utf-8")
+        self.assertTrue(setup.install(self.p))
+        installed = self.printer.read_text()
+        self.assertIn("[include klipper_revive.cfg]", installed)
+        self.assertLess(installed.index("[include klipper_revive.cfg]"),
+                        installed.index("SAVE_CONFIG"))
+        self.assertTrue(installed.endswith(self.SAVE_CONFIG_BLOCK.lstrip("\n")))
+        self.assertEqual(installed.count("[include klipper_revive.cfg]"), 1)
+        self.assertFalse(setup.install(self.p))
+        self.assertEqual(installed, self.printer.read_text())
+        self.assertTrue(setup.uninstall(self.p))
+        self.assertNotIn("[include klipper_revive.cfg]", self.printer.read_text())
+        self.assertIn("#*# z_offset = 1.235", self.printer.read_text())
+
+    def test_repair_legacy_include_below_save_config(self):
+        # Reproduces the live printer halt: Klipper rejects SAVE_CONFIG
+        # because the installer appended a non-#*# line after the header.
+        broken = (
+            "[probe]\npin: ^PA0\n" + self.SAVE_CONFIG_BLOCK
+            + "\n[include klipper_revive.cfg]\n"
+        )
+        self.printer.write_text(broken, encoding="utf-8")
+        self.assertTrue(setup.install(self.p))
+        repaired = self.printer.read_text()
+        self.assertLess(repaired.index("[include klipper_revive.cfg]"),
+                        repaired.index("SAVE_CONFIG"))
+        self.assertEqual(repaired.count("[include klipper_revive.cfg]"), 1)
+        self.assertIn(self.SAVE_CONFIG_BLOCK, repaired)
+        self.assertEqual(repaired.split("SAVE_CONFIG", 1)[1]
+                         .count("[include klipper_revive.cfg]"), 0)
+        self.assertFalse(setup.install(self.p))
+
+    def test_existing_include_above_autosave_untouched(self):
+        valid = (
+            "[probe]\npin: ^PA0\n\n[include klipper_revive.cfg]\n"
+            + self.SAVE_CONFIG_BLOCK
+        )
+        self.printer.write_text(valid, encoding="utf-8")
+        self.assertTrue(setup.install(self.p))
+        self.assertEqual(self.printer.read_text(), valid)
+
+    def test_ambiguous_autosave_headers_refused(self):
+        invalid = (
+            "[probe]\npin: ^PA0\n" + self.SAVE_CONFIG_BLOCK
+            + self.SAVE_CONFIG_BLOCK
+        )
+        self.printer.write_text(invalid, encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "Multiple SAVE_CONFIG"):
+            setup.install(self.p)
+        self.assertEqual(self.printer.read_text(), invalid)
+
     def test_foreign_module_refused_without_changes(self):
         self.p["extra"].write_text("# foreign module\n", encoding="utf-8")
         with self.assertRaisesRegex(RuntimeError, "Refusing"):
