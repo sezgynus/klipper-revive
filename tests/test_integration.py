@@ -211,8 +211,9 @@ class SmokeTest(unittest.TestCase):
             ids.append(self.module._session_id)
             self.assertFalse(self.module.get_status(0)['checkpoint_available'])
         self.assertNotEqual(ids[0], ids[1])
-        self.wait_until(lambda: CheckpointStore(self.directory).load()[1]
-                        .get('job_id') == ids[-1])
+        self.wait_until(lambda: (
+            (CheckpointStore(self.directory).load()[1] or {})
+            .get('job_id') == ids[-1]))
         self.assertEqual(CheckpointStore(self.directory).load()[1]['status'],
                          'invalidated')
         self.printer.callbacks['klippy:shutdown']()
