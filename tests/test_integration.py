@@ -140,7 +140,18 @@ class SmokeTest(unittest.TestCase):
         self.printer = Printer(file)
         self.directory = root / 'state'
         self.module = KlipperRevive(Config(self.printer, self.directory))
+        # The writer deliberately never joins on Klipper's reactor thread.
+        # Tests, however, must join it before removing temporary files.
+        # addCleanup is LIFO, so this precedes self.tmp.cleanup.
+        self.addCleanup(self.finish_checkpoint_worker)
         self.printer.callbacks['klippy:ready']()
+
+    def finish_checkpoint_worker(self):
+        self.module._on_stop()
+        thread = self.module.writer._thread
+        if thread is not None:
+            thread.join(5.)
+            self.assertFalse(thread.is_alive())
 
     def wait_until(self, predicate):
         until = time.monotonic() + 5
