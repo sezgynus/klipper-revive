@@ -192,11 +192,125 @@ class InstallerTests(unittest.TestCase):
                 with mock.patch.object(setup.subprocess, "run",
                                        return_value=SimpleNamespace(returncode=0)) as run:
                     setup.restart_if_safe(args, False, action="uninstall")
-                    self.assertEqual(run.call_count, 2)
+                    self.assertEqual(run.call_count, 3)
                     self.assertEqual(run.call_args_list[0].args[0],
-                                     ["sudo", "-n", "systemctl", "restart", "klipper"])
+                                     ["sudo", "-n", "-v"])
                     self.assertEqual(run.call_args_list[1].args[0],
+                                     ["sudo", "-n", "systemctl", "restart", "klipper"])
+                    self.assertEqual(run.call_args_list[2].args[0],
                                      ["sudo", "-n", "systemctl", "restart", "moonraker"])
+
+    def test_interactive_password_prompt_install_and_uninstall(self):
+        import io
+        args = SimpleNamespace(
+            no_restart=False, moonraker_url="http://127.0.0.1:7125",
+            klipper_service="klipper", moonraker_service="moonraker",
+        )
+        for action, changed in (("install", True), ("uninstall", False)):
+            # First sudo -n -v is rejected, then sudo -v prompts on
+            # /dev/tty even when installer stdin is a shell-script pipe.
+            terminal = io.StringIO()
+            results = [SimpleNamespace(returncode=n) for n in (1, 0, 0, 0)]
+            with self.subTest(action=action):
+                with mock.patch.object(setup, "idle_from_moonraker",
+                                       return_value=(True, "standby")) as idle:
+                    with mock.patch.object(setup.shutil, "which", return_value="/usr/bin/tool"):
+                        with mock.patch("builtins.open", return_value=terminal) as opened:
+                            with mock.patch.object(setup.subprocess, "run",
+                                                   side_effect=results) as run:
+                                setup.restart_if_safe(args, changed, action=action)
+                                self.assertEqual(run.call_count, 4)
+                                self.assertEqual(run.call_args_list[0].args[0],
+                                                 ["sudo", "-n", "-v"])
+                                self.assertEqual(run.call_args_list[1].args[0],
+                                                 ["sudo", "-v"])
+                                self.assertIs(run.call_args_list[1].kwargs["stdin"], terminal)
+                                self.assertEqual(run.call_args_list[2].args[0],
+                                                 ["sudo", "-n", "systemctl",
+                                                  "restart", "klipper"])
+                                self.assertEqual(run.call_args_list[3].args[0],
+                                                 ["sudo", "-n", "systemctl",
+                                                  "restart", "moonraker"])
+                                self.assertEqual(idle.call_count, 2)
+                                opened.assert_called_once_with("/dev/tty", "r+")
+
+    def test_no_terminal_does_not_consume_piped_stdin_or_restart(self):
+        args = SimpleNamespace(
+            no_restart=False, moonraker_url="http://127.0.0.1:7125",
+            klipper_service="klipper", moonraker_service="moonraker",
+        )
+        with mock.patch.object(setup, "idle_from_moonraker",
+                               return_value=(True, "standby")):
+            with mock.patch.object(setup.shutil, "which", return_value="/usr/bin/tool"):
+                with mock.patch.object(setup.subprocess, "run",
+                                       return_value=SimpleNamespace(returncode=1)) as run:
+                    with mock.patch("builtins.open", side_effect=OSError("no tty")):
+                        with self.assertRaisesRegex(RuntimeError,
+                                                    "no interactive terminal"):
+                            setup.restart_if_safe(args, True)
+                    self.assertEqual(run.call_count, 1)
+                    self.assertEqual(run.call_args.args[0], ["sudo", "-n", "-v"])
+
+    def test_password_authentication_failure_does_not_restart(self):
+        import io
+        args = SimpleNamespace(
+            no_restart=False, moonraker_url="http://127.0.0.1:7125",
+            klipper_service="klipper", moonraker_service="moonraker",
+        )
+        results = [SimpleNamespace(returncode=1), SimpleNamespace(returncode=1)]
+        with mock.patch.object(setup, "idle_from_moonraker",
+                               return_value=(True, "standby")):
+            with mock.patch.object(setup.shutil, "which", return_value="/usr/bin/tool"):
+                with mock.patch("builtins.open", return_value=io.StringIO()):
+                    with mock.patch.object(setup.subprocess, "run",
+                                           side_effect=results) as run:
+                        with self.assertRaisesRegex(RuntimeError, "authentication failed"):
+                            setup.restart_if_safe(args, True)
+                        self.assertEqual(run.call_count, 2)
+
+    def test_authentication_delay_rechecks_active_print(self):
+        args = SimpleNamespace(
+            no_restart=False, moonraker_url="http://127.0.0.1:7125",
+            klipper_service="klipper", moonraker_service="moonraker",
+        )
+        with mock.patch.object(setup, "idle_from_moonraker",
+                               side_effect=[(True, "standby"),
+                                            (False, "print_stats: printing")]) as idle:
+            with mock.patch.object(setup.shutil, "which", return_value="/usr/bin/tool"):
+                with mock.patch.object(setup.subprocess, "run",
+                                       return_value=SimpleNamespace(returncode=0)) as run:
+                    setup.restart_if_safe(args, True)
+                    self.assertEqual(idle.call_count, 2)
+                    self.assertEqual(run.call_count, 1)  # sudo -n -v only
+                    self.assertEqual(run.call_args.args[0], ["sudo", "-n", "-v"])
+
+    def test_service_failure_reports_error_and_skips_second_service(self):
+        args = SimpleNamespace(
+            no_restart=False, moonraker_url="http://127.0.0.1:7125",
+            klipper_service="klipper", moonraker_service="moonraker",
+        )
+        with mock.patch.object(setup, "idle_from_moonraker",
+                               return_value=(True, "standby")):
+            with mock.patch.object(setup.shutil, "which", return_value="/usr/bin/tool"):
+                with mock.patch.object(setup.subprocess, "run",
+                                       side_effect=[SimpleNamespace(returncode=0),
+                                                    SimpleNamespace(returncode=5)]) as run:
+                    with self.assertRaisesRegex(RuntimeError,
+                                                "Could not restart klipper"):
+                        setup.restart_if_safe(args, True)
+                    self.assertEqual(run.call_count, 2)
+
+    def test_no_restart_skips_sudo_for_both_actions(self):
+        args = SimpleNamespace(
+            no_restart=True, moonraker_url="http://127.0.0.1:7125",
+            klipper_service="klipper", moonraker_service="moonraker",
+        )
+        for action, changed in (("install", True), ("uninstall", False)):
+            with mock.patch.object(setup, "idle_from_moonraker") as idle:
+                with mock.patch.object(setup.subprocess, "run") as run:
+                    setup.restart_if_safe(args, changed, action=action)
+                    idle.assert_not_called()
+                    run.assert_not_called()
 
     def test_clean_install_does_not_restart(self):
         args = SimpleNamespace(

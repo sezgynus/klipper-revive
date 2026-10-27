@@ -236,41 +236,89 @@ def idle_from_moonraker(url):
     return False, "print_stats: " + str(print_state)
 
 
+def authorize_service_restart():
+    """Authenticate once, using the controlling SSH terminal when available.
+
+    In `curl ... | bash` installations stdin is a pipe, but /dev/tty
+    remains usable for the sudo password prompt. Never use sudo -S or
+    consume bytes from the downloaded shell script's stdin.
+    """
+    if shutil.which("sudo") is None or shutil.which("systemctl") is None:
+        error("Automatic restart requires sudo and systemctl. "
+              "Install these tools or run with --no-restart.")
+
+    # Quietly handle the common case where sudo credentials are cached
+    # or the installer user has passwordless sudo.
+    authorized = subprocess.run(
+        ["sudo", "-n", "-v"], check=False,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if authorized.returncode == 0:
+        return
+
+    # Standard input may contain the piped installer itself, not a TTY.
+    # /dev/tty is the *controlling* terminal, independent of stdin.
+    try:
+        terminal = open("/dev/tty", "r+")
+    except OSError:
+        error("sudo authentication is required but no interactive terminal "
+              "is available. Run the installer/uninstaller in an SSH "
+              "terminal, or use --no-restart and restart both services "
+              "manually when the printer is idle.")
+
+    with terminal:
+        print("Administrator permission is needed to restart Klipper and "
+              "Moonraker. Enter your sudo password in the terminal.",
+              flush=True)
+        authorized = subprocess.run(
+            ["sudo", "-v"], stdin=terminal, stdout=terminal,
+            stderr=terminal, check=False)
+    if authorized.returncode:
+        error("sudo authentication failed; configuration changes were "
+              "saved, but services were not restarted.")
+
+
 def restart_if_safe(args, changed, action="install"):
-    # Uninstall must also be capable of flushing an already-unlinked Python
-    # module from the *running* Klipper process. A previous uninstall may
-    # have skipped restart because the printer was printing or Moonraker was
-    # unreachable; re-running uninstall must try the restart again.
+    # Even a repeated uninstall may need to unload an already-unlinked
+    # Python module from the live Klipper process.
     needs_restart = changed or action == "uninstall"
     if not needs_restart:
         print("No changes; no restart needed.")
         return
     if args.no_restart:
-        print("Restart deferred by --no-restart. Klipper will retain loaded"
-              " modules/RAM until its service process is restarted.")
+        print("Restart deferred by --no-restart. Service processes must "
+              "be restarted when the printer is idle to apply changes.")
         return
+
     idle, state = idle_from_moonraker(args.moonraker_url)
     if not idle:
-        print("Automatic service restart deferred: " + state + ".")
-        print("Uninstall edits are saved, but loaded Python modules and RAM"
-              " remain until the Klipper service process is restarted.")
-        print("After verifying the printer is NOT printing or paused, run:"
-              " sudo systemctl restart " + args.klipper_service)
-        print("To clear the Moonraker update entry, also restart:"
-              " sudo systemctl restart " + args.moonraker_service)
+        print("Service restart deferred: " + state + ".")
+        print("Changes were saved, but running Klipper/Moonraker processes "
+              "will not reflect them until restarted.")
+        print("After verifying the printer is not printing or paused, run: "
+              "sudo systemctl restart " + args.klipper_service + " "
+              + args.moonraker_service)
         return
+
+    authorize_service_restart()
+
+    # Authentication can take time; check again before service changes.
+    # Do not recheck between Klipper and Moonraker restart because Klipper
+    # temporarily disconnects while the first restart is in progress.
+    idle, state = idle_from_moonraker(args.moonraker_url)
+    if not idle:
+        print("Service restart deferred: printer state changed while "
+              "awaiting authorization (" + state + ").")
+        return
+
     for service in (args.klipper_service, args.moonraker_service):
-        command = ["sudo", "-n", "systemctl", "restart", service]
-        if shutil.which("sudo") is None or shutil.which("systemctl") is None:
-            print("Automatic service restart unavailable; after confirming"
-                  " printer idle, run: sudo systemctl restart " + service)
-            continue
-        result = subprocess.run(command, check=False)
+        result = subprocess.run(
+            ["sudo", "-n", "systemctl", "restart", service], check=False)
         if result.returncode:
-            print("Could not restart", service,
-                  "- restart it manually after confirming printer idle.")
-        else:
-            print("Restarted", service)
+            error("Could not restart " + service + " (exit "
+                  + str(result.returncode) + "). Configuration changes "
+                  "were saved; verify the service status before continuing.")
+        print("Restarted", service)
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)

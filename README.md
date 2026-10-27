@@ -24,7 +24,7 @@ The installer:
 3. Adds `[include klipper_revive.cfg]` to `printer.cfg` **before Klipper's auto-generated `SAVE_CONFIG` block**. Re-running the installer repairs older installations that incorrectly placed the include below the block, without deleting stored probe calibration values.
 4. Creates a managed `klipper_revive_update.cfg` alongside `moonraker.conf`.
 5. Adds `[include klipper_revive_update.cfg]` to `moonraker.conf` if missing, registering **klipper-revive** as a Moonraker `git_repo` updater (`master`, `dev`, `managed_services: klipper`).
-6. Restarts Klipper and Moonraker **only when Moonraker confirms the printer is idle**. A printing/paused/unreachable printer is never restarted automatically.
+6. Restarts Klipper and Moonraker **only when Moonraker confirms the printer is idle** (or Klipper reports a startup configuration error). If `sudo` requires authentication, the installer prompts in the active SSH terminal, including when invoked through `curl | bash`, and rechecks printer state after the password prompt. A printing/paused/unreachable printer is never restarted automatically.
 
 No `SAVE_VARIABLE`, extra Python package, or dedicated service is installed. A single daemon writer thread is activated **only when there is a checkpoint to write**. A symlink stays valid when Moonraker updates repository contents. **Do not edit tracked files in the Git checkout**; Moonraker requires a clean repo to update.
 
@@ -44,6 +44,17 @@ bash ~/klipper-revive/install.sh \
 ```
 
 Use `--printer-config /path/to/printer.cfg` and `--moonraker-config /path/to/moonraker.conf` for independent overrides. `--no-restart` installs without restarting services. If the installer skips a restart, restart **Klipper and Moonraker only when the printer is idle**.
+
+The installer and uninstaller share the same safe service restart procedure.
+When privileges are not cached, run either command in a normal interactive SSH
+session and enter your sudo password when prompted. They do not read passwords
+from a piped installer script and will never hang waiting for terminal input
+in a noninteractive session. If sudo is unavailable or authentication fails,
+the scripts return an explicit error; config edits remain in place and service
+restarts must be completed when safe. With `--no-restart`, neither command
+attempts sudo. Uninstall restarts Klipper even on a repeat invocation when
+its files were previously removed, so loaded Python modules are unloaded
+from the running process.
 
 The normal installer is idempotent. It refuses to replace existing foreign `klipper_revive.py` files or unowned configuration snippets. It preserves one-time backups when changing existing main configuration files (`.klipper-revive.bak`).
 
