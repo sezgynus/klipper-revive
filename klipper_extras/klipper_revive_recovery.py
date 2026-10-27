@@ -163,7 +163,29 @@ class RecoverySession:
         self._check_unexpected_motion()
         self.phase = 'ready'
 
-    def resume(self, acknowledge_external=False):
+    def _open_resume_file(self, sd, gcmd, name):
+        """Select a file, including subdirectories, without starting SD.
+
+        M23 scans only the SD root and fails for paths such as test/cube.gcode.
+        SDCARD_PRINT_FILE supports subdirectories but starts printing before
+        we can seek to the checkpoint. Use its exact selection path directly
+        and preserve the interrupted job across the internal SD reset.
+        """
+        if gcmd is None:
+            raise RecoveryError('Recovery requires a G-code command context')
+        if not callable(getattr(sd, '_reset_file', None)) or not callable(
+                getattr(sd, '_load_file', None)):
+            raise RecoveryError('This Klipper virtual_sdcard API is unsupported')
+        if self.owner._recovery_reset_in_progress:
+            raise RecoveryError('Another recovery SD reset is already active')
+        self.owner._recovery_reset_in_progress = True
+        try:
+            sd._reset_file()
+        finally:
+            self.owner._recovery_reset_in_progress = False
+        sd._load_file(gcmd, name, check_subdirs=True)
+
+    def resume(self, acknowledge_external=False, gcmd=None):
         if self.phase != 'ready':
             raise RecoveryError('Confirm XY and Z before resuming')
         if not acknowledge_external:
@@ -221,7 +243,7 @@ class RecoverySession:
                                  % (generic, speed))
             # Restoring coordinates is complete; Klipper controls actual
             # subsequent moves using the calculated base_position.
-            self._script('M23 %s' % name)
+            self._open_resume_file(sd, gcmd, name)
             self._script('M26 S%d' % cp['file_position'])
             self.phase = 'resuming'
             self._script('M24')

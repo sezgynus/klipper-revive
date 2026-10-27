@@ -34,6 +34,7 @@ class KlipperRevive:
         # None means no new job has been selected since the last Klippy boot.
         # In that state a stored interrupted-print checkpoint remains usable.
         self._session_id = None
+        self._recovery_reset_in_progress = False
         self.recovery = RecoverySession(
             self,
             z_hop=config.getfloat('recovery_z_hop', 10., above=0.),
@@ -95,6 +96,10 @@ class KlipperRevive:
                 self.enabled = False
 
     def _on_file_reset(self):
+        if self._recovery_reset_in_progress:
+            # Revive reselects the *same* interrupted job before M26/M24.
+            # Do not tombstone the checkpoint during its internal file load.
+            return
         # SDCARD_PRINT_FILE, M23 and SDCARD_RESET_FILE reset VirtualSD.
         # The old checkpoint must not be exposed even while the background
         # writer is still persisting the invalidation tombstone.
@@ -265,7 +270,8 @@ class KlipperRevive:
 
     def cmd_resume(self, gcmd):
         acknowledge = gcmd.get_int('EXTERNAL_STATE_OK', 0, minval=0, maxval=1)
-        self._recover_call(gcmd, lambda: self.recovery.resume(acknowledge == 1))
+        self._recover_call(gcmd, lambda: self.recovery.resume(
+            acknowledge == 1, gcmd=gcmd))
         gcmd.respond_info('Revive: resumed virtual SD print.')
 
     def cmd_cancel(self, gcmd):

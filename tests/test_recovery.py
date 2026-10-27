@@ -63,9 +63,29 @@ class FakeSD:
     def __init__(self):
         self.sdcard_dirname = '/tmp'
         self.active = False
+        self.file_position = 0
+        self.on_reset = None
+        self.reset_count = 0
+        self.open_calls = []
+        self.fail_open = False
 
     def is_active(self):
         return self.active
+
+    def _reset_file(self):
+        self.reset_count += 1
+        self.active = False
+        self.file_position = 0
+        if self.on_reset is not None:
+            self.on_reset()
+
+    def _load_file(self, gcmd, filename, check_subdirs=False):
+        self.open_calls.append((filename, check_subdirs, self.active))
+        if self.fail_open:
+            raise RuntimeError('Unable to open file')
+        if '/' in filename and not check_subdirs:
+            raise RuntimeError('M23 does not scan subdirectories')
+        gcmd.respond_raw('File selected')
 
 
 class FakeGcode:
@@ -79,6 +99,8 @@ class FakeGcode:
         self.calls.append(script)
         if script == 'G28 X Y':
             self.head.pos[:2] = [0., 0.]
+        if script.startswith('M26 S'):
+            self.sd.file_position = int(script[5:])
         if script == 'M24':
             self.sd.active = True
             self.stats.state = 'printing'
@@ -121,6 +143,13 @@ class FakeOwner:
             }
         }
         self.writer = SimpleNamespace(last_saved=self.snapshot)
+        self._recovery_reset_in_progress = False
+        self.unexpected_resets = 0
+        self.printer.objects['virtual_sdcard'].on_reset = self._on_reset
+
+    def _on_reset(self):
+        if not self._recovery_reset_in_progress:
+            self.unexpected_resets += 1
 
     def validate_checkpoint(self):
         return True, 'Validated'
@@ -149,15 +178,68 @@ class GuidedRecoveryTests(unittest.TestCase):
         session.confirm_z()
         with self.assertRaisesRegex(RecoveryError, 'EXTERNAL_STATE_OK'):
             session.resume()
-        session.resume(True)
+        messages = []
+        session.resume(True, gcmd=SimpleNamespace(respond_raw=messages.append))
         self.assertEqual(session.phase, 'complete')
-        self.assertEqual(self.owner.gcode.calls[-3:],
-                         ['M23 cube.gcode', 'M26 S1234', 'M24'])
+        self.assertEqual(self.owner.gcode.calls[-2:],
+                         ['M26 S1234', 'M24'])
+        sd = self.owner.printer.objects['virtual_sdcard']
+        self.assertEqual(sd.open_calls, [('cube.gcode', True, False)])
+        self.assertEqual(sd.file_position, 1234)
+        self.assertEqual(sd.reset_count, 1)
+        self.assertEqual(self.owner.unexpected_resets, 0)
+        self.assertFalse(self.owner._recovery_reset_in_progress)
         move = self.owner.printer.objects['gcode_move']
         self.assertAlmostEqual(move.base_position[0], .2)
         self.assertAlmostEqual(move.base_position[1], -.3)
         self.assertAlmostEqual(move.base_position[2], .05)
         self.assertAlmostEqual(move.base_position[3], -200.)
+
+    def test_subdirectory_resume_opens_before_seek_and_start(self):
+        cp = self.owner.snapshot
+        cp['file']['path'] = '/tmp/test/Kup_ABS_12m16s.gcode'
+        session = self.session
+        session.prepare()
+        session.confirm_xy()
+        session.confirm_z()
+        sd = self.owner.printer.objects['virtual_sdcard']
+        messages = []
+        session.resume(True, gcmd=SimpleNamespace(respond_raw=messages.append))
+        self.assertEqual(sd.open_calls, [
+            ('test/Kup_ABS_12m16s.gcode', True, False)])
+        self.assertEqual(sd.file_position, cp['file_position'])
+        self.assertTrue(sd.active)
+        self.assertEqual(self.owner.gcode.calls[-2:],
+                         ['M26 S1234', 'M24'])
+        self.assertEqual(self.owner.unexpected_resets, 0)
+        self.assertIn('File selected', messages)
+
+    def test_file_open_error_keeps_checkpoint_and_releases_reset_guard(self):
+        session = self.session
+        session.prepare()
+        session.confirm_xy()
+        session.confirm_z()
+        sd = self.owner.printer.objects['virtual_sdcard']
+        sd.fail_open = True
+        saved = self.owner.writer.last_saved
+        with self.assertRaisesRegex(RuntimeError, 'Unable to open file'):
+            session.resume(True, gcmd=SimpleNamespace(respond_raw=lambda _: None))
+        self.assertEqual(session.phase, 'error')
+        self.assertIs(self.owner.writer.last_saved, saved)
+        self.assertEqual(self.owner.unexpected_resets, 0)
+        self.assertFalse(self.owner._recovery_reset_in_progress)
+        self.assertNotIn('M24', self.owner.gcode.calls)
+
+    def test_missing_gcode_context_fails_before_sd_reset(self):
+        session = self.session
+        session.prepare()
+        session.confirm_xy()
+        session.confirm_z()
+        with self.assertRaisesRegex(RecoveryError, 'G-code command context'):
+            session.resume(True)
+        sd = self.owner.printer.objects['virtual_sdcard']
+        self.assertEqual(sd.reset_count, 0)
+        self.assertNotIn('M24', self.owner.gcode.calls)
 
     def test_wrong_phase_adjustment_rejected(self):
         with self.assertRaises(RecoveryError):

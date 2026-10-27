@@ -161,7 +161,7 @@ Recovery is **opt-in**: it never begins after boot by itself. After a failed pri
    KLIPPER_REVIVE_RESUME EXTERNAL_STATE_OK=1
    ```
 
-This restores standard captured coordinate/extrusion modes, speeds, bed mesh **only if a named persisted profile is available**, regular/generic fan speeds, saved active extruder and bed/nozzle targets. It selects the same G-code file and seeks the recorded byte position using Klipper's existing virtual SD functionality. The next queued G-code may repeat part of an already printed segment.
+This restores standard captured coordinate/extrusion modes, speeds, bed mesh **only if a named persisted profile is available**, regular/generic fan speeds, saved active extruder and bed/nozzle targets. It selects the same G-code file (including a file in a virtual SD subdirectory) without starting the print, seeks to the recorded byte position, and only then starts virtual SD printing. Klipper's `M23` command cannot search subdirectories; recovery uses the same subdirectory-aware file loader as `SDCARD_PRINT_FILE` without its automatic start. This internal file reset is not treated as a *new* print session, so it does not invalidate the very checkpoint being recovered. The next queued G-code may repeat part of an already printed segment.
 
 At any alignment stage `KLIPPER_REVIVE_CANCEL` stops the wizard **without movement**. Since Klipper's Z reference was manually assigned, restart Klipper before normal printing after cancellation. If the actual nozzle seems lower than expected, do not confirm or jog downward.
 

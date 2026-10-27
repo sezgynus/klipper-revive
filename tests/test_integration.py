@@ -203,6 +203,28 @@ class SmokeTest(unittest.TestCase):
                         .get('status') == 'invalidated')
         self.printer.callbacks['klippy:shutdown']()
 
+    def test_recovery_internal_reset_does_not_invalidate_interrupted_job(self):
+        timer = self.printer.reactor.callback
+        timer(1.)
+        self.wait_for(1)
+        previous = self.module._recoverable_checkpoint()
+        self.assertIsNotNone(previous)
+
+        # Internal file re-selection during Revive recovery must not be
+        # mistaken for the start of a new user-requested print.
+        self.module._recovery_reset_in_progress = True
+        try:
+            self.printer.callbacks['virtual_sdcard:reset_file']()
+        finally:
+            self.module._recovery_reset_in_progress = False
+        self.assertIs(self.module._recoverable_checkpoint(), previous)
+        self.assertEqual(self.module.writer.sequence, 1)
+
+        # Outside of that narrow guard, a user reset still invalidates it.
+        self.printer.callbacks['virtual_sdcard:reset_file']()
+        self.assertIsNone(self.module._recoverable_checkpoint())
+        self.printer.callbacks['klippy:shutdown']()
+
     def test_repeated_file_reset_creates_distinct_sessions(self):
         self.printer.stats.state = 'standby'
         ids = []
