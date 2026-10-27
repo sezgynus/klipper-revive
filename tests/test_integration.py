@@ -153,18 +153,6 @@ class SmokeTest(unittest.TestCase):
             thread.join(5.)
             self.assertFalse(thread.is_alive())
 
-    def emit_motion(self, line='G1 X12', pos=None):
-        sd = self.printer.objects['virtual_sdcard']
-        if pos is not None:
-            sd.file_position = pos
-        sd.cmd_from_sd = True
-        sd.next_file_position = sd.file_position + len(line.encode()) + 1
-        try:
-            self.printer.gcode.run_script(line)
-        finally:
-            sd.cmd_from_sd = False
-            sd.file_position = sd.next_file_position
-
     def wait_until(self, predicate):
         until = time.monotonic() + 5
         while time.monotonic() < until:
@@ -176,7 +164,8 @@ class SmokeTest(unittest.TestCase):
     def test_same_file_new_print_hides_previous_checkpoint_immediately(self):
         # M27 for a new print can be at byte 20 while an old same-file
         # checkpoint is at byte 100. That old state must never be offered.
-        self.emit_motion()
+        timer = self.printer.reactor.callback
+        timer(1.)
         self.wait_for(1)
         previous = self.module._recoverable_checkpoint()
         self.assertEqual(previous['file_position'], 100)
@@ -199,7 +188,7 @@ class SmokeTest(unittest.TestCase):
                         .get('status') == 'invalidated')
         sd.file_position = 20
         self.printer.stats.state = 'printing'
-        self.emit_motion(pos=20)
+        timer(3.)
         self.wait_until(lambda: self.module._recoverable_checkpoint() is not None)
         current = self.module._recoverable_checkpoint()
         self.assertEqual(current['file_position'], 20)
@@ -210,7 +199,8 @@ class SmokeTest(unittest.TestCase):
     def test_interrupted_checkpoint_survives_restart_until_next_job(self):
         # A Klippy restart by itself is not a fresh print. A previously
         # interrupted checkpoint remains available until file selection.
-        self.emit_motion()
+        timer = self.printer.reactor.callback
+        timer(1.)
         self.wait_for(1)
         old = self.module._recoverable_checkpoint()
         self.printer.callbacks['klippy:shutdown']()
@@ -267,7 +257,8 @@ class SmokeTest(unittest.TestCase):
         self.printer.callbacks['klippy:shutdown']()
 
     def test_recovery_internal_reset_does_not_invalidate_interrupted_job(self):
-        self.emit_motion()
+        timer = self.printer.reactor.callback
+        timer(1.)
         self.wait_for(1)
         previous = self.module._recoverable_checkpoint()
         self.assertIsNotNone(previous)
@@ -321,99 +312,119 @@ class SmokeTest(unittest.TestCase):
         sd = self.printer.objects['virtual_sdcard']
         sd.file_position = 45
         self.printer.stats.state = 'printing'
-        self.emit_motion(pos=45)
+        self.printer.reactor.callback(1.)
         self.wait_until(lambda: self.module._recoverable_checkpoint() is not None)
         self.assertEqual(self.module.get_status(1.)['file_position'], 45)
         self.printer.callbacks['klippy:shutdown']()
 
-    def test_each_movement_line_snapshots_before_dispatch_without_time_gate(self):
+    def test_completed_sd_lines_checkpoint_during_timer_starvation(self):
+        # Reproduces real Klipper: SD file_position advances only *after*
+        # gcode.run_script returns, while reactor timers mostly run inside
+        # long/yielding G-code commands (cmd_from_sd stays True).
+        sd = self.printer.objects['virtual_sdcard']
+        clock = [0.0]
+        self.printer.reactor.monotonic = lambda: clock[0]
+        sd.cmd_from_sd = True
+        sd.file_position = 100
+        sd.next_file_position = 200
+
+        # Timer runs in the middle of command -> must be rejected.
+        timer = self.printer.reactor.callback
+        timer(0.0)
+        self.assertEqual(self.module.writer.sequence, 0)
+
+        # Command succeeds. Post-command hook commits *next* position,
+        # not the stale 100-byte file_position.
+        self.printer.gcode.run_script('G1 X11')
+        self.wait_for(1)
+        self.assertEqual(self.module.writer.last_saved['file_position'], 200)
+        sd.file_position = 200
+
+        # The next 6 seconds are spent inside repeated commands; the
+        # timer never observes cmd_from_sd == False.
+        clock[0] = 6.0
+        sd.next_file_position = 500
+        timer(6.0)
+        self.assertEqual(self.module.writer.sequence, 1)
+        self.printer.gcode.run_script('G1 X22')
+        self.wait_for(2)
+        self.assertEqual(self.module.writer.last_saved['file_position'], 500)
+        sd.file_position = 500
+        sd.cmd_from_sd = False
+        self.printer.callbacks['klippy:shutdown']()
+
+    def test_five_second_gate_at_completed_sd_boundaries(self):
+        # Capture is time-gated, but the persisted byte still comes from
+        # the completed SD G-code line, never the command currently executing.
         sd = self.printer.objects['virtual_sdcard']
         clock = [0.]
         self.printer.reactor.monotonic = lambda: clock[0]
-        captured = []
-        original_submit = self.module.writer.submit
-        self.module.writer.submit = lambda cp: (
-            captured.append(dict(cp)), original_submit(cp))[1]
-        executed = []
-        self.printer.gcode.run_callback = lambda script: (
-            executed.append(script),
-            self.assertEqual(captured[-1]['file_position'],
-                             sd.file_position))
-        for pos in (100, 200, 300, 400):
-            sd.file_position = pos
-            sd.cmd_from_sd = True
-            sd.next_file_position = pos + 20
-            self.printer.gcode.run_script('G1 X%.1f' % (pos / 10.))
-            sd.cmd_from_sd = False
-            sd.file_position = sd.next_file_position
-        self.assertEqual(len(executed), 4)
-        self.assertEqual([cp['file_position'] for cp in captured if
-                          cp.get('status') == 'printing'],
-                         [100, 200, 300, 400])
-        self.assertTrue(all(cp['job_id'] == self.module._session_id
-                            for cp in captured))
-        self.assertEqual(clock[0], 0.)
-        self.wait_until(lambda: self.module.writer.last_saved is not None and
-                        self.module.writer.last_saved.get('file_position') == 400)
+        self.assertEqual(self.module.checkpoint_interval, 5.)
+        sd.cmd_from_sd = True
+        sd.file_position = 100
+        sd.next_file_position = 200
+        self.printer.gcode.run_script('G1 X11')
+        self.wait_for(1)
+        self.assertEqual(self.module.writer.last_saved['file_position'], 200)
+
+        # Four more seconds of commands do not trigger a new checkpoint.
+        clock[0] = 4.9
+        sd.file_position = 200
+        sd.next_file_position = 300
+        self.printer.gcode.run_script('G1 X12')
+        self.assertEqual(self.module.writer.sequence, 1)
+        self.assertEqual(self.module.writer.last_saved['file_position'], 200)
+
+        # At exactly five seconds the next completed line is recorded.
+        clock[0] = 5.
+        sd.file_position = 300
+        sd.next_file_position = 400
+        self.printer.gcode.run_script('G1 X13')
+        self.wait_for(2)
+        self.assertEqual(self.module.writer.last_saved['file_position'], 400)
+        sd.cmd_from_sd = False
         self.printer.callbacks['klippy:shutdown']()
 
-    def test_only_motion_commands_checkpoint_and_nested_scripts_ignored(self):
+    def test_five_second_timer_fallback_between_sd_commands(self):
+        # The timer can sample only while VirtualSD isn't dispatching.
         sd = self.printer.objects['virtual_sdcard']
-        captures = []
-        old_capture = self.module.collector.capture
-
-        def record_capture(*args, **kwargs):
-            snapshot = old_capture(*args, **kwargs)
-            if snapshot is not None:
-                captures.append(snapshot['file_position'])
-            return snapshot
-        self.module.collector.capture = record_capture
-        for index, command in enumerate((
-            '; G1 X100', 'M104 S200', 'SET_PRESSURE_ADVANCE ADVANCE=0.1',
-            'M220 S50', 'G17', 'G1_SOMETHING X10', 'G4 P100',
-        )):
-            self.emit_motion(line=command, pos=100 + index * 20)
-        self.assertEqual(captures, [])
-        for index, command in enumerate((
-            '  g0 X2  ', 'G1 E-0.5', 'G2 X10 Y10 I1 J1',
-            'G3 X11 Y11 I1 J1', 'G10', 'G11', 'G28 X Y',
-            'N123 G1 X12', 'G1 X4 ; travel',
-        )):
-            self.emit_motion(line=command, pos=300 + index * 20)
-        self.assertEqual(captures,
-                         [300 + index * 20 for index in range(9)])
+        timer = self.printer.reactor.callback
+        timer(0.)
+        self.wait_for(1)
+        self.assertEqual(self.module.writer.last_saved['file_position'], 100)
+        sd.file_position = 150
+        timer(4.9)
+        self.assertEqual(self.module.writer.sequence, 1)
+        sd.file_position = 250
+        timer(5.)
+        self.wait_for(2)
+        self.assertEqual(self.module.writer.last_saved['file_position'], 250)
         self.printer.callbacks['klippy:shutdown']()
 
-    def test_nested_and_failed_motion_command_record_start_boundary(self):
+    def test_sd_hook_skips_failed_commands_and_nested_scripts(self):
         sd = self.printer.objects['virtual_sdcard']
-        clock = [0.]
+        clock = [0.0]
         self.printer.reactor.monotonic = lambda: clock[0]
-        captured = []
-        capture = self.module.collector.capture
-
-        def tracing(*args, **kwargs):
-            out = capture(*args, **kwargs)
-            if out:
-                captured.append(out['file_position'])
-            return out
-        self.module.collector.capture = tracing
+        sd.cmd_from_sd = True
+        sd.next_file_position = 300
 
         def nested(script):
-            if script == 'G1 X11':
-                self.printer.gcode.run_script('G1 X99')
-            elif script == 'G1 XFAIL':
-                raise RuntimeError('failed G-code')
+            if script == 'OUTER':
+                # Nested macros don't represent a finished SD file line.
+                self.printer.gcode.run_script('INNER')
+                self.assertEqual(self.module.writer.sequence, 0)
         self.printer.gcode.run_callback = nested
-        self.emit_motion(line='G1 X11', pos=300)
-        self.assertEqual(captured, [300])
+        self.printer.gcode.run_script('OUTER')
+        self.wait_for(1)
+        self.assertEqual(self.module.writer.last_saved['file_position'], 300)
 
-        sd.cmd_from_sd = True
-        sd.file_position = 400
-        sd.next_file_position = 410
+        clock[0] = 20.0
+        sd.next_file_position = 400
+        self.printer.gcode.run_callback = lambda script: (_ for _ in ()).throw(
+            RuntimeError('failed G-code'))
         with self.assertRaisesRegex(RuntimeError, 'failed G-code'):
-            self.printer.gcode.run_script('G1 XFAIL')
-        self.assertEqual(captured, [300, 400])
-        sd.cmd_from_sd = False
+            self.printer.gcode.run_script('FAIL')
+        self.assertEqual(self.module.writer.sequence, 1)
         self.printer.callbacks['klippy:shutdown']()
 
     def test_shutdown_unhooks_gcode_dispatch(self):
@@ -446,7 +457,8 @@ class SmokeTest(unittest.TestCase):
         self.fail('checkpoint worker did not flush')
 
     def test_print_checkpoint_validate_and_complete(self):
-        self.emit_motion()
+        timer = self.printer.reactor.callback
+        timer(1.)
         self.wait_for(1)
         s = self.module.get_status(0)
         self.assertTrue(s['checkpoint_available'])
@@ -461,14 +473,14 @@ class SmokeTest(unittest.TestCase):
             self.module.writer.last_saved['firmware_retraction']['retract_length'],
             1.)
         self.printer.stats.state = 'complete'
-        self.printer.reactor.callback(2.)
+        timer(2.)
         self.wait_for(2)
         self.assertFalse(self.module.get_status(0)['checkpoint_available'])
         self.assertEqual(CheckpointStore(self.directory).load()[1]['status'], 'complete')
         self.printer.callbacks['klippy:shutdown']()
 
     def test_file_modification_blocks_validation(self):
-        self.emit_motion()
+        self.printer.reactor.callback(1.)
         self.wait_for(1)
         file = Path(self.printer.objects['virtual_sdcard'].file)
         file.write_bytes(b'G1 X0\n')
@@ -477,7 +489,6 @@ class SmokeTest(unittest.TestCase):
 
     def test_no_checkpoint_when_paused(self):
         self.printer.stats.state = 'paused'
-        self.emit_motion()
         self.printer.reactor.callback(1.)
         self.assertEqual(self.module.writer.sequence, 0)
         self.printer.callbacks['klippy:shutdown']()

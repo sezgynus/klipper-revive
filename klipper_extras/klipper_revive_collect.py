@@ -1,7 +1,7 @@
-"""Minimal, bounded Klipper state capture at SD motion-command entry.
+"""Minimal, bounded Klipper state sampling. Runs only from reactor timer.
 
-No filesystem, network, or G-code dispatch. The collector reads a strict
-whitelist of Klipper state; persistence runs on a separate worker thread.
+No filesystem, network, or gcode dispatch. The collector deliberately uses
+whitelisted Klipper state and does not attempt to serialize arbitrary plugins.
 """
 import math
 
@@ -44,29 +44,34 @@ class StateCollector:
         self.firmware_retraction = self.printer.lookup_object(
             'firmware_retraction', None)
 
-    def capture(self, eventtime, at_motion_start=False):
-        """Snapshot the state *before* the current SD motion command.
+    def capture(self, eventtime, after_sd_command=False):
+        """Capture a matching G-code state and byte boundary.
 
-        VirtualSD sets cmd_from_sd=True and next_file_position to the
-        END of the current line just before invoking gcode.run_script().
-        file_position still points to that line's START. Use that address
-        so recovery re-enters at the current command, not the next one.
+        Timer samples are valid only outside SD command dispatch.
+        A post-command hook runs after gcode.run_script() has completed
+        successfully, but before VirtualSD copies next_file_position into
+        file_position; use that *completed* boundary, not the stale field.
         """
         if self.stats.state != 'printing':
             return None
-        if not at_motion_start or not self.sd.cmd_from_sd:
-            return None
-        position_field = 'file_position'
+        if after_sd_command:
+            if not self.sd.cmd_from_sd:
+                return None
+            position_field = 'next_file_position'
+        else:
+            if self.sd.cmd_from_sd:
+                return None
+            position_field = 'file_position'
         path = self.sd.file_path()
         before = int(getattr(self.sd, position_field))
         size = int(self.sd.file_size)
-        if not path or before < 0 or size <= 0 or before >= size:
+        if not path or before <= 0 or size <= 0 or before >= size:
             return None
         gc = self.move.get_status(eventtime)
         machine = [number(v) for v in self.toolhead.get_position()[:4]]
         extruder = self.toolhead.get_extruder().get_name()
-        # Live tuning can change via G-code, UI, macros or filament profiles.
-        # Read it on motion events; non-motion SD lines do not trigger capture.
+        # Live tuning may change via G-code, UI, macros, or filament profiles.
+        # Read it only when a checkpoint is due, not on every SD command.
         toolhead_status = self.toolhead.get_status(eventtime)
         limit_keys = ('max_velocity', 'max_accel',
                       'square_corner_velocity', 'minimum_cruise_ratio')
@@ -101,7 +106,7 @@ class StateCollector:
         if self.mesh is not None and self.mesh.z_mesh is not None:
             mesh_name = str(self.mesh.z_mesh.get_profile_name() or '')
         # Reject any interleaved source-file advancement.
-        if (not self.sd.cmd_from_sd
+        if (self.sd.cmd_from_sd != after_sd_command
                 or self.stats.state != 'printing'
                 or int(getattr(self.sd, position_field)) != before
                 or self.sd.file_path() != path):
