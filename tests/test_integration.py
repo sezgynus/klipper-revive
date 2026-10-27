@@ -31,6 +31,10 @@ class Gcode:
     def register_command(self, name, callback, desc=None):
         self.commands[name] = callback
 
+    def run_script(self, script):
+        if getattr(self, 'run_callback', None) is not None:
+            return self.run_callback(script)
+
 
 class Obj:
     def __init__(self, **values):
@@ -43,6 +47,7 @@ class Obj:
 class SD:
     cmd_from_sd = False
     file_position = 100
+    next_file_position = 100
     file_size = 1000
 
     def __init__(self, file):
@@ -128,6 +133,76 @@ class SmokeTest(unittest.TestCase):
         self.directory = root / 'state'
         self.module = KlipperRevive(Config(self.printer, self.directory))
         self.printer.callbacks['klippy:ready']()
+
+    def test_completed_sd_lines_checkpoint_during_timer_starvation(self):
+        # Reproduces real Klipper: SD file_position advances only *after*
+        # gcode.run_script returns, while reactor timers mostly run inside
+        # long/yielding G-code commands (cmd_from_sd stays True).
+        sd = self.printer.objects['virtual_sdcard']
+        clock = [0.0]
+        self.printer.reactor.monotonic = lambda: clock[0]
+        sd.cmd_from_sd = True
+        sd.file_position = 100
+        sd.next_file_position = 200
+
+        # Timer runs in the middle of command -> must be rejected.
+        timer = self.printer.reactor.callback
+        timer(0.0)
+        self.assertEqual(self.module.writer.sequence, 0)
+
+        # Command succeeds. Post-command hook commits *next* position,
+        # not the stale 100-byte file_position.
+        self.printer.gcode.run_script('G1 X11')
+        self.wait_for(1)
+        self.assertEqual(self.module.writer.last_saved['file_position'], 200)
+        sd.file_position = 200
+
+        # The next 16 seconds are spent inside repeated commands; the
+        # timer never observes cmd_from_sd == False.
+        clock[0] = 16.0
+        sd.next_file_position = 500
+        timer(16.0)
+        self.assertEqual(self.module.writer.sequence, 1)
+        self.printer.gcode.run_script('G1 X22')
+        self.wait_for(2)
+        self.assertEqual(self.module.writer.last_saved['file_position'], 500)
+        sd.file_position = 500
+        sd.cmd_from_sd = False
+        self.printer.callbacks['klippy:shutdown']()
+
+    def test_sd_hook_skips_failed_commands_and_nested_scripts(self):
+        sd = self.printer.objects['virtual_sdcard']
+        clock = [0.0]
+        self.printer.reactor.monotonic = lambda: clock[0]
+        sd.cmd_from_sd = True
+        sd.next_file_position = 300
+
+        def nested(script):
+            if script == 'OUTER':
+                # Nested macros don't represent a finished SD file line.
+                self.printer.gcode.run_script('INNER')
+                self.assertEqual(self.module.writer.sequence, 0)
+        self.printer.gcode.run_callback = nested
+        self.printer.gcode.run_script('OUTER')
+        self.wait_for(1)
+        self.assertEqual(self.module.writer.last_saved['file_position'], 300)
+
+        clock[0] = 20.0
+        sd.next_file_position = 400
+        self.printer.gcode.run_callback = lambda script: (_ for _ in ()).throw(
+            RuntimeError('failed G-code'))
+        with self.assertRaisesRegex(RuntimeError, 'failed G-code'):
+            self.printer.gcode.run_script('FAIL')
+        self.assertEqual(self.module.writer.sequence, 1)
+        self.printer.callbacks['klippy:shutdown']()
+
+    def test_shutdown_unhooks_gcode_dispatch(self):
+        wrapper = self.printer.gcode.run_script
+        self.assertIsNotNone(self.module._sd_dispatch_original)
+        self.printer.callbacks['klippy:shutdown']()
+        self.assertIsNot(self.printer.gcode.run_script, wrapper)
+        self.assertIsNone(self.module._sd_dispatch_wrapper)
+        self.assertFalse(self.module.enabled)
 
     def test_recovery_commands_registered_without_motion(self):
         commands = self.printer.gcode.commands

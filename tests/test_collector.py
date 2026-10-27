@@ -19,6 +19,7 @@ class Obj:
 class SD:
     cmd_from_sd = False
     file_position = 100
+    next_file_position = 120
     file_size = 1200
 
     def file_path(self):
@@ -77,6 +78,32 @@ class CollectorTests(unittest.TestCase):
         self.printer.sd.cmd_from_sd = True
         self.assertIsNone(self.collector.capture(0))
         self.printer.sd.cmd_from_sd = False
+
+    def test_completed_sd_line_uses_next_position_not_stale_position(self):
+        sd = self.printer.sd
+        sd.cmd_from_sd = True
+        sd.file_position = 100
+        sd.next_file_position = 280
+        self.assertIsNone(self.collector.capture(1.0))
+        state = self.collector.capture(1.0, after_sd_command=True)
+        self.assertEqual(state['file_position'], 280)
+        self.assertEqual(sd.file_position, 100)
+
+    def test_completed_line_rejects_position_change_during_capture(self):
+        sd = self.printer.sd
+        sd.cmd_from_sd = True
+        sd.next_file_position = 280
+        original = self.collector.move.get_status
+
+        def progress_during_capture(eventtime):
+            sd.next_file_position = 450
+            return original(eventtime)
+
+        self.collector.move.get_status = progress_during_capture
+        self.assertIsNone(self.collector.capture(1.0, after_sd_command=True))
+
+    def test_completed_line_rejects_invalid_phase(self):
+        self.assertIsNone(self.collector.capture(1.0, after_sd_command=True))
 
     def test_skip_changed_file_position(self):
         old = self.collector.move.get_status

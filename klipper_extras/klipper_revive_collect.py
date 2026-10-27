@@ -41,16 +41,26 @@ class StateCollector:
                      if name == 'fan' or name.startswith('fan_generic ')]
         self.mesh = self.printer.lookup_object('bed_mesh', None)
 
-    def capture(self, eventtime):
-        """Return one bounded plain-data snapshot, or None when not printing.
+    def capture(self, eventtime, after_sd_command=False):
+        """Capture a matching G-code state and byte boundary.
 
-        Never poll data while Klipper is executing a file command: yieldable
-        macros can otherwise change state while file_position is still old.
+        Timer samples are valid only outside SD command dispatch.
+        A post-command hook runs after gcode.run_script() has completed
+        successfully, but before VirtualSD copies next_file_position into
+        file_position; use that *completed* boundary, not the stale field.
         """
-        if self.stats.state != 'printing' or self.sd.cmd_from_sd:
+        if self.stats.state != 'printing':
             return None
+        if after_sd_command:
+            if not self.sd.cmd_from_sd:
+                return None
+            position_field = 'next_file_position'
+        else:
+            if self.sd.cmd_from_sd:
+                return None
+            position_field = 'file_position'
         path = self.sd.file_path()
-        before = int(self.sd.file_position)
+        before = int(getattr(self.sd, position_field))
         size = int(self.sd.file_size)
         if not path or before <= 0 or size <= 0 or before >= size:
             return None
@@ -69,8 +79,10 @@ class StateCollector:
         if self.mesh is not None and self.mesh.z_mesh is not None:
             mesh_name = str(self.mesh.z_mesh.get_profile_name() or '')
         # Reject any interleaved source-file advancement.
-        if self.sd.cmd_from_sd or self.stats.state != 'printing' \
-                or self.sd.file_position != before or self.sd.file_path() != path:
+        if (self.sd.cmd_from_sd != after_sd_command
+                or self.stats.state != 'printing'
+                or int(getattr(self.sd, position_field)) != before
+                or self.sd.file_path() != path):
             return None
         return {
             'schema': SCHEMA_VERSION,

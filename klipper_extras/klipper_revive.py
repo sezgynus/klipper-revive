@@ -25,6 +25,9 @@ class KlipperRevive:
         self.collector = None
         self.timer = None
         self.next_checkpoint = 0.
+        self._sd_dispatch_original = None
+        self._sd_dispatch_wrapper = None
+        self._script_depth = 0
         self.enabled = True
         self.closed_job = False
         self.recovery = RecoverySession(
@@ -55,6 +58,7 @@ class KlipperRevive:
     def _on_ready(self):
         try:
             self.collector = StateCollector(self.printer)
+            self._install_sd_completion_hook()
             self.timer = self.reactor.register_timer(self._sample, self.reactor.NOW)
         except Exception:
             logging.exception('Klipper Revive disabled: required Klipper objects unavailable')
@@ -62,10 +66,72 @@ class KlipperRevive:
 
     def _on_stop(self):
         self.enabled = False
+        self._remove_sd_completion_hook()
         if self.timer is not None:
             self.reactor.unregister_timer(self.timer)
             self.timer = None
         self.writer.close()
+
+    def _install_sd_completion_hook(self):
+        """Observe successful file-command boundaries without modifying Klipper.
+
+        VirtualSD runs gcode.run_script(line) while cmd_from_sd=True, then
+        advances file_position to next_file_position. Timers frequently fire
+        INSIDE a yieldable command; post-command capture is the stable point.
+        """
+        if self._sd_dispatch_wrapper is not None:
+            return
+        original = self.gcode.run_script
+
+        def run_script_with_checkpoint(script):
+            self._script_depth += 1
+            try:
+                result = original(script)
+                # Nested scripts/macros aren't complete SD file lines.
+                if (self._script_depth == 1 and self.enabled
+                        and self.collector is not None
+                        and self.collector.sd.cmd_from_sd):
+                    try:
+                        self._capture_if_due(self.reactor.monotonic(),
+                                             after_sd_command=True)
+                    except Exception:
+                        # Checkpoint failures must not change Klipper's
+                        # handling of a successfully executed G-code line.
+                        logging.exception('Klipper Revive command checkpoint failed')
+                        self.enabled = False
+                return result
+            finally:
+                self._script_depth -= 1
+
+        self._sd_dispatch_original = original
+        self._sd_dispatch_wrapper = run_script_with_checkpoint
+        self.gcode.run_script = run_script_with_checkpoint
+
+    def _remove_sd_completion_hook(self):
+        if self._sd_dispatch_wrapper is not None:
+            if self.gcode.run_script is self._sd_dispatch_wrapper:
+                self.gcode.run_script = self._sd_dispatch_original
+            self._sd_dispatch_wrapper = None
+            self._sd_dispatch_original = None
+
+    def _capture_if_due(self, eventtime, after_sd_command=False):
+        if not self.enabled or self.writer.last_error is not None:
+            self.enabled = False
+            return
+        if eventtime < self.next_checkpoint:
+            return
+        snapshot = self.collector.capture(eventtime,
+                                          after_sd_command=after_sd_command)
+        if snapshot is None:
+            return
+        previous = self.writer.last_saved
+        # Don't save the same/older byte offset, including a timer sample
+        # that races with the checkpoint worker's latest pending snapshot.
+        if (previous is None or previous.get('status') != 'printing'
+                or snapshot['file'].get('path') != previous['file'].get('path')
+                or snapshot['file_position'] > previous['file_position']):
+            self.writer.submit(snapshot)
+        self.next_checkpoint = eventtime + self.checkpoint_interval
 
     def _sample(self, eventtime):
         if not self.enabled or self.writer.last_error is not None:
@@ -75,23 +141,14 @@ class KlipperRevive:
             state = self.collector.stats.state
             if state == 'printing':
                 self.closed_job = False
-                if eventtime >= self.next_checkpoint:
-                    snapshot = self.collector.capture(eventtime)
-                    if snapshot is not None:
-                        previous = self.writer.last_saved
-                        if (previous is None
-                                or snapshot['file_position'] != previous.get('file_position')
-                                or snapshot['file'] != previous.get('file')
-                                or previous.get('status') != 'printing'):
-                            self.writer.submit(snapshot)
-                        self.next_checkpoint = eventtime + self.checkpoint_interval
+                self._capture_if_due(eventtime)
             elif state in ('complete', 'cancelled'):
                 if not self.closed_job:
                     self.writer.submit({'schema': 1, 'status': state})
                     self.closed_job = True
-            # On a print error/shutdown the last good checkpoint remains valid.
+            # Keep last good checkpoint on print error/shutdown.
         except Exception:
-            logging.exception('Klipper Revive sampler disabled; printing is unaffected')
+            logging.exception('Klipper Revive sampler disabled; printing unaffected')
             self.enabled = False
             return self.reactor.NEVER
         return eventtime + self.sample_interval

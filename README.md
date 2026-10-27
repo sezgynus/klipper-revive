@@ -28,7 +28,7 @@ The installer:
 
 No `SAVE_VARIABLE`, extra Python package, or dedicated service is installed. A single daemon writer thread is activated **only when there is a checkpoint to write**. A symlink stays valid when Moonraker updates repository contents. **Do not edit tracked files in the Git checkout**; Moonraker requires a clean repo to update.
 
-The module offers `KLIPPER_REVIVE_STATUS`, `KLIPPER_REVIVE_INSPECT`, `KLIPPER_REVIVE_VALIDATE` and the explicit recovery commands described below. Sampling uses a 1-second lightweight state timer, with checkpoint writes at most every 15 seconds by default when progress changes. A bounded two-slot checkpoint store keeps the last valid checkpoint with a SHA-256 digest and atomic replacement. All `stat`, serialization, and disk flush operations run in a worker thread. Normal printing never causes recovery motion. Physical recovery movement occurs only when the user sends recovery commands.
+The module offers `KLIPPER_REVIVE_STATUS`, `KLIPPER_REVIVE_INSPECT`, `KLIPPER_REVIVE_VALIDATE` and the explicit recovery commands described below. Checkpoints are sampled at completed virtual SD G-code line boundaries when 15 seconds have elapsed, with a 1-second timer as a fallback for idle gaps. The line-boundary observer wraps Klipper's `gcode.run_script` at startup and restores it on shutdown; it never changes any command's outcome or motor state. This avoids sampling only in the middle of a command while `virtual_sdcard.cmd_from_sd` is set. A bounded two-slot checkpoint store keeps the last valid checkpoint with a SHA-256 digest and atomic replacement. All `stat`, serialization, and disk flush operations run in a worker thread. Normal printing never causes recovery motion. Physical recovery movement occurs only when the user sends recovery commands.
 
 ### Custom installations
 
@@ -100,7 +100,7 @@ KLIPPER_REVIVE_STATUS
 KLIPPER_REVIVE_INSPECT
 ```
 
-After 15–20 seconds of movement, `checkpoint=True` and `seq>=1` should be reported (exact timing depends on the first sample). The file and byte position should advance over later samples. Check the on-disk files in `~/printer_data/klipper_revive/checkpoint.[01].json`.
+After 15–20 seconds of movement, `checkpoint=True` and `seq>=1` should be reported (exact timing depends on the first sample). The file and byte position should advance over later samples. Compare `KLIPPER_REVIVE_STATUS` `pos` with Klipper's own `M27` SD byte position at least twice 30 seconds apart: the Revive checkpoint should advance. A nonzero lag is normal due to the 15-second interval and queued moves, but a position frozen across minutes while `M27` advances indicates failure and must be fixed **before any recovery experiment**. Check the on-disk files in `~/printer_data/klipper_revive/checkpoint.[01].json`.
 
 After stopping the test print **normally**, the checkpoint is invalidated (a completion/cancellation tombstone). To test preservation on a true interruption, use only a disposable test print: a Klipper RESTART/shutdown before normal completion should leave the last valid checkpoint on disk. On return, `KLIPPER_REVIVE_INSPECT` should show it, and `KLIPPER_REVIVE_VALIDATE` should verify its original G-code file. **Do not trigger an uncontrolled power outage or deliberate MCU failure for testing.** Use a disposable print and intentional software restart only after confirming this test will not damage hardware.
 
