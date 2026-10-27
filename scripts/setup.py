@@ -116,7 +116,7 @@ def updater_text(repo):
         + "channel: dev\n"
         + "path: " + str(repo) + "\n"
         + "origin: " + ORIGIN + "\n"
-        + "primary_branch: main\n"
+        + "primary_branch: master\n"
         + "managed_services: klipper\n"
     )
 

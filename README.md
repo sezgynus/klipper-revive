@@ -14,7 +14,7 @@ bash ~/klipper-revive/install.sh
 Or use the one-line bootstrap, which clones the repository automatically:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sezgynus/klipper-revive/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/sezgynus/klipper-revive/master/install.sh | bash
 ```
 
 The installer:
@@ -23,7 +23,7 @@ The installer:
 2. Creates a managed `klipper_revive.cfg` alongside `printer.cfg` containing `[klipper_revive]`.
 3. Adds `[include klipper_revive.cfg]` to `printer.cfg` **before Klipper's auto-generated `SAVE_CONFIG` block**. Re-running the installer repairs older installations that incorrectly placed the include below the block, without deleting stored probe calibration values.
 4. Creates a managed `klipper_revive_update.cfg` alongside `moonraker.conf`.
-5. Adds `[include klipper_revive_update.cfg]` to `moonraker.conf` if missing, registering **klipper-revive** as a Moonraker `git_repo` updater (`main`, `dev`, `managed_services: klipper`).
+5. Adds `[include klipper_revive_update.cfg]` to `moonraker.conf` if missing, registering **klipper-revive** as a Moonraker `git_repo` updater (`master`, `dev`, `managed_services: klipper`).
 6. Restarts Klipper and Moonraker **only when Moonraker confirms the printer is idle**. A printing/paused/unreachable printer is never restarted automatically.
 
 No `SAVE_VARIABLE`, extra Python package, or dedicated service is installed. A single daemon writer thread is activated **only when there is a checkpoint to write**. A symlink stays valid when Moonraker updates repository contents. **Do not edit tracked files in the Git checkout**; Moonraker requires a clean repo to update.
@@ -154,7 +154,7 @@ Default recovery config (add options to `klipper_revive.cfg`):
 
 ### Updating
 
-Use **Machine > Update Manager > klipper-revive** in Mainsail/Fluidd. Moonraker updates the checkout and restarts the matched Klipper service after an update. The integration targets the `main` branch on the `dev` channel. Before the first semantic version tag, some UI clients may not show version/update controls.
+Use **Machine > Update Manager > klipper-revive** in Mainsail/Fluidd. Moonraker updates the checkout and restarts the matched Klipper service after an update. The integration targets the `master` branch on the `dev` channel. Before the first semantic version tag, some UI clients may not show version/update controls.
 
 The installer **must be run once** to create local symlinks/config entries; Moonraker's deprecated `install_script` update-manager property does not re-run extension installers on updates.
 

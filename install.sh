@@ -20,7 +20,7 @@ else
             echo "Refusing to overwrite existing path: $REPO_DIR" >&2
             exit 1
         fi
-        git clone --branch main https://github.com/sezgynus/klipper-revive.git "$REPO_DIR"
+        git clone --branch master https://github.com/sezgynus/klipper-revive.git "$REPO_DIR"
     fi
 fi
 

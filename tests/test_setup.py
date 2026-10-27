@@ -40,7 +40,7 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("[include klipper_revive.cfg]", self.printer.read_text())
         self.assertIn("[include klipper_revive_update.cfg]", self.moon.read_text())
         updater = (self.moon.parent / setup.MOONRAKER_NAME).read_text()
-        for key in ("type: git_repo", "primary_branch: main", "managed_services: klipper"):
+        for key in ("type: git_repo", "primary_branch: master", "managed_services: klipper"):
             self.assertIn(key, updater)
         self.assertFalse(setup.install(self.p))
         self.assertEqual(self.printer.read_text().count("[include klipper_revive.cfg]"), 1)
@@ -114,6 +114,17 @@ class InstallerTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Multiple SAVE_CONFIG"):
             setup.install(self.p)
         self.assertEqual(self.printer.read_text(), invalid)
+
+    def test_upgrade_old_moonraker_main_branch_to_master(self):
+        old = setup.updater_text(self.p["repo"]).replace(
+            "primary_branch: master", "primary_branch: main")
+        updater = self.moon.parent / setup.MOONRAKER_NAME
+        updater.write_text(old, encoding="utf-8")
+        self.assertTrue(setup.install(self.p))
+        text = updater.read_text(encoding="utf-8")
+        self.assertIn("primary_branch: master", text)
+        self.assertNotIn("primary_branch: main", text)
+        self.assertFalse(setup.install(self.p))
 
     def test_foreign_module_refused_without_changes(self):
         self.p["extra"].write_text("# foreign module\n", encoding="utf-8")

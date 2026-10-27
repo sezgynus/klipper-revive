@@ -3,7 +3,7 @@ name: Sign Commits
 on:
   push:
     branches:
-      - main
+      - master
   workflow_dispatch:
 
 permissions:
@@ -61,4 +61,4 @@ jobs:
         shell: bash
         run: |
           git commit --amend --no-edit -S
-          git push --force-with-lease origin HEAD:main
+          git push --force-with-lease origin HEAD:master
