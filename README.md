@@ -45,19 +45,24 @@ bash ~/klipper-revive/install.sh \
 
 Use `--printer-config /path/to/printer.cfg` and `--moonraker-config /path/to/moonraker.conf` for independent overrides. `--no-restart` installs without restarting services. If the installer skips a restart, restart **Klipper and Moonraker only when the printer is idle**.
 
-The installer and uninstaller share the same safe service restart procedure.
-Re-running either command retries the service restart when safe, even if the managed
-files are unchanged, so a previous failed authentication cannot leave Revive
-installed but inactive indefinitely.
-When privileges are not cached, run either command in a normal interactive SSH
-session and enter your sudo password when prompted. They do not read passwords
-from a piped installer script and will never hang waiting for terminal input
-in a noninteractive session. If sudo is unavailable or authentication fails,
-the scripts return an explicit error; config edits remain in place and service
-restarts must be completed when safe. With `--no-restart`, neither command
-attempts sudo. Uninstall restarts Klipper even on a repeat invocation when
-its files were previously removed, so loaded Python modules are unloaded
-from the running process.
+The installer and uninstaller use the same three-stage output:
+**checking paths → updating managed files → applying services**.
+When Moonraker confirms the printer is idle, plain `sudo -v` requests a
+password **only when needed**, using sudo's normal terminal prompt, followed
+by service restarts. This behaves like the Petrel installer and also works
+with `curl | bash` in a regular SSH session with a controlling terminal.
+The scripts never open `/dev/tty` themselves, read a password from piped
+stdin, or suppress an ordinary sudo password request with `sudo -n`.
+
+When the printer is `printing`, `paused`, unavailable, or in a shutdown
+state, service restarts are postponed without a sudo prompt. In a session
+where sudo cannot authenticate, installation reports a clear failure rather
+than silently pretending the services were restarted. Existing files remain
+installed, and the command can be run again once authentication is possible.
+The `--no-restart` option skips authorization and all restarts; re-running
+install/uninstall retries the safe restart even when files are unchanged.
+A repeat uninstallation also restarts services to unload the old Klipper
+module when the printer is idle.
 
 The normal installer is idempotent. It refuses to replace existing foreign `klipper_revive.py` files or unowned configuration snippets. It preserves one-time backups when changing existing main configuration files (`.klipper-revive.bak`).
 

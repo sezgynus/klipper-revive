@@ -237,87 +237,69 @@ def idle_from_moonraker(url):
 
 
 def authorize_service_restart():
-    """Authenticate once, using the controlling SSH terminal when available.
+    """Let sudo handle authentication directly, as in Petrel's installer.
 
-    In `curl ... | bash` installations stdin is a pipe, but /dev/tty
-    remains usable for the sudo password prompt. Never use sudo -S or
-    consume bytes from the downloaded shell script's stdin.
+    sudo reads a password from its controlling terminal, not stdin, so this
+    also works when install.sh is fed to bash through curl | bash.
+    No terminal probing, /dev/tty opening, -n authentication checks, or
+    password forwarding are required.
     """
     if shutil.which("sudo") is None or shutil.which("systemctl") is None:
         error("Automatic restart requires sudo and systemctl. "
-              "Install these tools or run with --no-restart.")
+              "Install them, or use --no-restart.")
 
-    # Quietly handle the common case where sudo credentials are cached
-    # or the installer user has passwordless sudo.
-    authorized = subprocess.run(
-        ["sudo", "-n", "-v"], check=False,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if authorized.returncode == 0:
-        return
+    print("  Authorizing service restart (sudo will request your password"
+          " if needed)...", flush=True)
+    result = subprocess.run(["sudo", "-v"], check=False)
+    if result.returncode:
+        error("sudo authorization failed. Files were updated, but services "
+              "were not restarted. Run the installer again in your normal "
+              "SSH terminal to retry.")
 
-    # Standard input may contain the piped installer itself, not a TTY.
-    # /dev/tty is the *controlling* terminal, independent of stdin.
-    try:
-        terminal = open("/dev/tty", "r+")
-    except OSError:
-        error("sudo authentication is required but no interactive terminal "
-              "is available. Run the installer/uninstaller in an SSH "
-              "terminal, or use --no-restart and restart both services "
-              "manually when the printer is idle.")
 
-    with terminal:
-        print("Administrator permission is needed to restart Klipper and "
-              "Moonraker. Enter your sudo password in the terminal.",
-              flush=True)
-        authorized = subprocess.run(
-            ["sudo", "-v"], stdin=terminal, stdout=terminal,
-            stderr=terminal, check=False)
-    if authorized.returncode:
-        error("sudo authentication failed; configuration changes were "
-              "saved, but services were not restarted.")
+
+def _deferred_restart(args, reason):
+    print("  Service restart deferred: " + reason)
+    print("  Files are ready. No running printer service was changed.")
+    print("  Once the printer is idle, restart with:")
+    print("    sudo systemctl restart " + args.klipper_service
+          + " " + args.moonraker_service)
+    return False
 
 
 def restart_if_safe(args, changed, action="install"):
-    # A prior install may have written the config/symlinks but failed to
-    # restart services (e.g. sudo needed a password). Explicit reruns of
-    # install and uninstall always retry a SAFE restart, even when the
-    # managed files are already in their target state.
-    if not changed:
-        print("Managed files unchanged; checking for a safe service restart.")
+    """Apply changes if safe and authorized, otherwise finish gracefully.
+
+    On a repeat run, retry service activation even if files are unchanged.
+    The Moonraker safety check is repeated after interactive authorization.
+    """
+    print("[3/3] Applying services")
     if args.no_restart:
-        print("Restart deferred by --no-restart. Service processes must "
-              "be restarted when the printer is idle to apply changes.")
-        return
+        return _deferred_restart(args, "--no-restart selected")
 
     idle, state = idle_from_moonraker(args.moonraker_url)
     if not idle:
-        print("Service restart deferred: " + state + ".")
-        print("Changes were saved, but running Klipper/Moonraker processes "
-              "will not reflect them until restarted.")
-        print("After verifying the printer is not printing or paused, run: "
-              "sudo systemctl restart " + args.klipper_service + " "
-              + args.moonraker_service)
-        return
+        return _deferred_restart(args, state)
 
     authorize_service_restart()
 
-    # Authentication can take time; check again before service changes.
-    # Do not recheck between Klipper and Moonraker restart because Klipper
-    # temporarily disconnects while the first restart is in progress.
     idle, state = idle_from_moonraker(args.moonraker_url)
     if not idle:
-        print("Service restart deferred: printer state changed while "
-              "awaiting authorization (" + state + ").")
-        return
+        return _deferred_restart(args, "printer state changed (" + state + ")")
 
     for service in (args.klipper_service, args.moonraker_service):
         result = subprocess.run(
-            ["sudo", "-n", "systemctl", "restart", service], check=False)
+            ["sudo", "systemctl", "restart", service],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            text=True)
         if result.returncode:
-            error("Could not restart " + service + " (exit "
-                  + str(result.returncode) + "). Configuration changes "
-                  "were saved; verify the service status before continuing.")
-        print("Restarted", service)
+            reason = "Could not restart " + service
+            detail = (getattr(result, "stderr", "") or "").strip()
+            if detail:
+                reason += " (" + detail.splitlines()[-1] + ")"
+            error(reason + ". Files were updated; rerun install when idle.")
+        print("  Restarted " + service)
+    return True
 
 
 def main():
@@ -334,9 +316,23 @@ def main():
     args = parser.parse_args()
     if os.geteuid() == 0:
         error("Run as the normal printer user, not root")
+    print("Klipper Revive " + ("installation" if args.action == "install"
+                                 else "uninstallation"))
+    print("[1/3] Checking paths and configuration")
     p = paths(args)
+    print("[2/3] Updating managed files")
     changed = install(p) if args.action == "install" else uninstall(p)
-    restart_if_safe(args, changed, action=args.action)
+    if not changed:
+        print("  Files already in the requested state.")
+    restarted = restart_if_safe(args, changed, action=args.action)
+    print("")
+    if restarted:
+        print("Klipper Revive " + ("installed" if args.action == "install"
+                                   else "removed") + " and services restarted.")
+    else:
+        print("Klipper Revive files " + ("installed" if args.action == "install"
+                                         else "removed")
+              + "; service restart pending.")
 
 
 if __name__ == "__main__":
