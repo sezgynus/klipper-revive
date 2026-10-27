@@ -46,6 +46,9 @@ bash ~/klipper-revive/install.sh \
 Use `--printer-config /path/to/printer.cfg` and `--moonraker-config /path/to/moonraker.conf` for independent overrides. `--no-restart` installs without restarting services. If the installer skips a restart, restart **Klipper and Moonraker only when the printer is idle**.
 
 The installer and uninstaller share the same safe service restart procedure.
+Re-running either command retries the service restart when safe, even if the managed
+files are unchanged, so a previous failed authentication cannot leave Revive
+installed but inactive indefinitely.
 When privileges are not cached, run either command in a normal interactive SSH
 session and enter your sudo password when prompted. They do not read passwords
 from a piped installer script and will never hang waiting for terminal input

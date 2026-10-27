@@ -312,15 +312,31 @@ class InstallerTests(unittest.TestCase):
                     idle.assert_not_called()
                     run.assert_not_called()
 
-    def test_clean_install_does_not_restart(self):
+    def test_repeat_install_retries_restart_after_failed_prior_restart(self):
         args = SimpleNamespace(
             no_restart=False, moonraker_url="http://127.0.0.1:7125",
             klipper_service="klipper", moonraker_service="moonraker",
         )
-        with mock.patch.object(setup, "idle_from_moonraker") as idle:
+        with mock.patch.object(setup, "idle_from_moonraker",
+                               return_value=(True, "standby")) as idle:
+            with mock.patch.object(setup.shutil, "which", return_value="/usr/bin/tool"):
+                with mock.patch.object(setup.subprocess, "run",
+                                       return_value=SimpleNamespace(returncode=0)) as run:
+                    setup.restart_if_safe(args, False, action="install")
+                    self.assertEqual(idle.call_count, 2)
+                    self.assertEqual(run.call_count, 3)
+                    self.assertEqual(run.call_args_list[1].args[0],
+                                     ["sudo", "-n", "systemctl", "restart", "klipper"])
+
+    def test_repeat_install_defers_restart_during_print(self):
+        args = SimpleNamespace(
+            no_restart=False, moonraker_url="http://127.0.0.1:7125",
+            klipper_service="klipper", moonraker_service="moonraker",
+        )
+        with mock.patch.object(setup, "idle_from_moonraker",
+                               return_value=(False, "print_stats: printing")):
             with mock.patch.object(setup.subprocess, "run") as run:
                 setup.restart_if_safe(args, False, action="install")
-                idle.assert_not_called()
                 run.assert_not_called()
 
     def test_uninstall_never_restarts_when_printing(self):

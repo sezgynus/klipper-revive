@@ -278,12 +278,12 @@ def authorize_service_restart():
 
 
 def restart_if_safe(args, changed, action="install"):
-    # Even a repeated uninstall may need to unload an already-unlinked
-    # Python module from the live Klipper process.
-    needs_restart = changed or action == "uninstall"
-    if not needs_restart:
-        print("No changes; no restart needed.")
-        return
+    # A prior install may have written the config/symlinks but failed to
+    # restart services (e.g. sudo needed a password). Explicit reruns of
+    # install and uninstall always retry a SAFE restart, even when the
+    # managed files are already in their target state.
+    if not changed:
+        print("Managed files unchanged; checking for a safe service restart.")
     if args.no_restart:
         print("Restart deferred by --no-restart. Service processes must "
               "be restarted when the printer is idle to apply changes.")
