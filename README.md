@@ -164,7 +164,34 @@ The installer **must be run once** to create local symlinks/config entries; Moon
 bash ~/klipper-revive/uninstall.sh
 ```
 
-Accepts the same path and `--no-restart` flags. Removes only its owned symlink, managed snippets, and include lines, while leaving the repository and unrelated user configurations untouched. Restart Klipper/Moonraker when idle if the script skips the restart.
+Accepts the same path and `--no-restart` flags. Removes only its owned symlinks, managed snippets, and include lines, leaving the repository, checkpoint files, and unrelated user configurations untouched.
+
+**RAM is not freed when Python files or symlinks are removed.** Klipper has already imported the module into its *running* Python process. The uninstaller now attempts a **full systemd service process restart** for Klipper and Moonraker once Moonraker confirms the printer is idle. A repeat `uninstall.sh` also retries the restart even if there are no files left to delete, fixing older versions that silently skipped restart after removing their files.
+
+When Klipper has a startup/configuration `error`, Moonraker cannot query `print_stats`; the uninstaller treats that startup error as not printing and restarts safely. During `printing` or `paused`, or when Klipper is `shutdown` from an emergency stop, `startup`, `disconnected`, or Moonraker is unavailable, **automatic restarts are forbidden**. The script prints the manual restart commands; run them only after confirming no print is active. Re-running uninstall after the printer becomes idle is supported:
+
+```bash
+bash ~/klipper-revive/uninstall.sh
+```
+
+If the old uninstaller already removed everything and memory is still high, once you have confirmed there is no running or paused print:
+
+```bash
+sudo systemctl restart klipper
+sudo systemctl restart moonraker
+```
+
+Klipper `RESTART` / `FIRMWARE_RESTART` G-code commands **do not reload host Python source**; use a **service** restart to ensure no old module remains resident. If service restart fails or Moonraker cannot confirm idle status, uninstall will explicitly report the pending restart rather than claiming RAM was released.
+
+To compare actual private/shared RAM instead of virtual address-space size, sample the process *after* a normal idle start:
+
+```bash
+pid=$(systemctl show -p MainPID --value klipper)
+sudo grep -E '^(Rss|Pss|Private_Clean|Private_Dirty):' "/proc/$pid/smaps_rollup"
+```
+
+Compare equivalent Klipper idle states before/after installation and after removal. Checkpoint files in `~/printer_data/klipper_revive/` are persistent **disk data**, not resident RAM, and are deliberately preserved.
+
 
 ## Safety and development
 

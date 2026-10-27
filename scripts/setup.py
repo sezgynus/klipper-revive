@@ -210,40 +210,67 @@ def uninstall(p):
 
 
 def idle_from_moonraker(url):
-    """Fail closed on unreachable Moonraker or ambiguous printer status."""
+    """Confirm that reloading the host cannot interrupt an active print.
+
+    /server/info remains available when Klippy cannot load its configuration;
+    print_stats is unavailable in that state. Treat a startup config error as
+    safe to restart, but NEVER infer safety from a disconnected / starting host
+    or an emergency shutdown. Those states require operator confirmation.
+    """
+    base = url.rstrip("/")
     try:
-        with urlopen(url.rstrip("/") + "/printer/objects/query?print_stats", timeout=2) as response:
+        with urlopen(base + "/server/info", timeout=2) as response:
+            info = json.load(response)["result"]
+        state = info["klippy_state"]
+        if state == "error":
+            return True, "Klipper configuration/startup error"
+        if state != "ready":
+            return False, "Klipper state: " + str(state)
+        with urlopen(base + "/printer/objects/query?print_stats", timeout=2) as response:
             data = json.load(response)
-        state = data["result"]["status"]["print_stats"]["state"]
+        print_state = data["result"]["status"]["print_stats"]["state"]
     except (OSError, ValueError, KeyError, TypeError) as exc:
         return False, "printer state unavailable (" + str(exc) + ")"
-    if state in ("standby", "complete", "cancelled", "error"):
-        return True, state
-    return False, str(state)
+    if print_state in ("standby", "complete", "cancelled", "error"):
+        return True, "print_stats: " + print_state
+    return False, "print_stats: " + str(print_state)
 
 
-def restart_if_safe(args, changed):
-    if not changed:
+def restart_if_safe(args, changed, action="install"):
+    # Uninstall must also be capable of flushing an already-unlinked Python
+    # module from the *running* Klipper process. A previous uninstall may
+    # have skipped restart because the printer was printing or Moonraker was
+    # unreachable; re-running uninstall must try the restart again.
+    needs_restart = changed or action == "uninstall"
+    if not needs_restart:
         print("No changes; no restart needed.")
         return
     if args.no_restart:
-        print("Restart skipped by --no-restart.")
+        print("Restart deferred by --no-restart. Klipper will retain loaded"
+              " modules/RAM until its service process is restarted.")
         return
     idle, state = idle_from_moonraker(args.moonraker_url)
     if not idle:
-        print("Restart skipped: " + state + ". Restart Klipper and Moonraker when idle.")
+        print("Automatic service restart deferred: " + state + ".")
+        print("Uninstall edits are saved, but loaded Python modules and RAM"
+              " remain until the Klipper service process is restarted.")
+        print("After verifying the printer is NOT printing or paused, run:"
+              " sudo systemctl restart " + args.klipper_service)
+        print("To clear the Moonraker update entry, also restart:"
+              " sudo systemctl restart " + args.moonraker_service)
         return
     for service in (args.klipper_service, args.moonraker_service):
         command = ["sudo", "-n", "systemctl", "restart", service]
         if shutil.which("sudo") is None or shutil.which("systemctl") is None:
-            print("Automatic restart unavailable. Restart", service, "when idle.")
+            print("Automatic service restart unavailable; after confirming"
+                  " printer idle, run: sudo systemctl restart " + service)
             continue
         result = subprocess.run(command, check=False)
         if result.returncode:
-            print("Could not restart", service, "- restart it manually when idle.")
+            print("Could not restart", service,
+                  "- restart it manually after confirming printer idle.")
         else:
             print("Restarted", service)
-
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -261,7 +288,7 @@ def main():
         error("Run as the normal printer user, not root")
     p = paths(args)
     changed = install(p) if args.action == "install" else uninstall(p)
-    restart_if_safe(args, changed)
+    restart_if_safe(args, changed, action=args.action)
 
 
 if __name__ == "__main__":

@@ -147,6 +147,81 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("host: 0.0.0.0", self.moon.read_text())
         self.assertTrue((self.printer.parent / "printer.cfg.klipper-revive.bak").exists())
 
+    def test_moonraker_state_restart_safety(self):
+        import io
+        import json
+
+        def check(klippy_state, print_state=None):
+            def fake_urlopen(url, timeout):
+                if url.endswith("/server/info"):
+                    data = {"result": {"klippy_state": klippy_state}}
+                else:
+                    self.assertTrue(url.endswith("/printer/objects/query?print_stats"))
+                    data = {"result": {"status": {
+                        "print_stats": {"state": print_state}}}}
+                return io.BytesIO(json.dumps(data).encode("utf-8"))
+
+            with mock.patch.object(setup, "urlopen", side_effect=fake_urlopen):
+                return setup.idle_from_moonraker("http://127.0.0.1:7125")
+
+        self.assertTrue(check("error")[0])
+        for state in ("startup", "disconnected", "shutdown", "unknown"):
+            # An emergency shutdown must NEVER be automatically restarted.
+            self.assertFalse(check(state)[0], state)
+        for state in ("standby", "complete", "cancelled", "error"):
+            self.assertTrue(check("ready", state)[0], state)
+        for state in ("printing", "paused", "unknown"):
+            self.assertFalse(check("ready", state)[0], state)
+
+    def test_moonraker_unreachable_fails_closed(self):
+        with mock.patch.object(setup, "urlopen", side_effect=OSError("offline")):
+            safe, reason = setup.idle_from_moonraker("http://127.0.0.1:7125")
+        self.assertFalse(safe)
+        self.assertIn("unavailable", reason)
+
+    def test_uninstall_retries_restart_when_already_removed(self):
+        args = SimpleNamespace(
+            no_restart=False, moonraker_url="http://127.0.0.1:7125",
+            klipper_service="klipper", moonraker_service="moonraker",
+        )
+        # Re-running uninstall after a previously skipped service restart
+        # must still unload the Python module from the live Klipper process.
+        with mock.patch.object(setup, "idle_from_moonraker",
+                               return_value=(True, "print_stats: standby")):
+            with mock.patch.object(setup.shutil, "which", return_value="/usr/bin/tool"):
+                with mock.patch.object(setup.subprocess, "run",
+                                       return_value=SimpleNamespace(returncode=0)) as run:
+                    setup.restart_if_safe(args, False, action="uninstall")
+                    self.assertEqual(run.call_count, 2)
+                    self.assertEqual(run.call_args_list[0].args[0],
+                                     ["sudo", "-n", "systemctl", "restart", "klipper"])
+                    self.assertEqual(run.call_args_list[1].args[0],
+                                     ["sudo", "-n", "systemctl", "restart", "moonraker"])
+
+    def test_clean_install_does_not_restart(self):
+        args = SimpleNamespace(
+            no_restart=False, moonraker_url="http://127.0.0.1:7125",
+            klipper_service="klipper", moonraker_service="moonraker",
+        )
+        with mock.patch.object(setup, "idle_from_moonraker") as idle:
+            with mock.patch.object(setup.subprocess, "run") as run:
+                setup.restart_if_safe(args, False, action="install")
+                idle.assert_not_called()
+                run.assert_not_called()
+
+    def test_uninstall_never_restarts_when_printing(self):
+        args = SimpleNamespace(
+            no_restart=False, moonraker_url="http://127.0.0.1:7125",
+            klipper_service="klipper", moonraker_service="moonraker",
+        )
+        for status in ("print_stats: printing", "print_stats: paused",
+                       "Klipper state: shutdown"):
+            with mock.patch.object(setup, "idle_from_moonraker",
+                                   return_value=(False, status)):
+                with mock.patch.object(setup.subprocess, "run") as run:
+                    setup.restart_if_safe(args, False, action="uninstall")
+                    run.assert_not_called()
+
     def test_restarts_skipped_when_state_unknown_or_active(self):
         args = SimpleNamespace(
             no_restart=False,
