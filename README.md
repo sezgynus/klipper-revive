@@ -189,7 +189,52 @@ Recovery is **opt-in**: it never begins after boot by itself. After a failed pri
    KLIPPER_REVIVE_RESUME EXTERNAL_STATE_OK=1
    ```
 
+   Revive now resumes at **10% feedrate** by default using `M220 S10`,
+   regardless of the previous checkpoint's speed override. Override it
+   explicitly with `SPEED` (percentage, 1–200):
+
+   ```gcode
+   KLIPPER_REVIVE_RESUME EXTERNAL_STATE_OK=1 SPEED=25
+   ```
+
+   This is a feedrate percentage, **not** a change to the stored
+   `max_velocity` or `max_accel`. The selected percentage remains active
+   until the print or operator changes it (for example `M220 S100` or the
+   Mainsail speed slider). There is no automatic return to 100%.
+
 This restores standard captured coordinate/extrusion modes, speeds, bed mesh **only if a named persisted profile is available**, regular/generic fan speeds, saved active extruder and bed/nozzle targets. It selects the same G-code file (including a file in a virtual SD subdirectory) without starting the print, seeks to the recorded byte position, and only then starts virtual SD printing. Klipper's `M23` command cannot search subdirectories; recovery uses the same subdirectory-aware file loader as `SDCARD_PRINT_FILE` without its automatic start. This internal file reset is not treated as a *new* print session, so it does not invalidate the very checkpoint being recovered. Any saved dynamic motion limits, pressure advance, and firmware retraction parameters are validated and restored **before** the first resumed SD G-code command. The next queued G-code may repeat part of an already printed segment.
+
+### Live XY/Z adjustment after recovery
+
+The same Revive alignment commands remain usable after
+`KLIPPER_REVIVE_RESUME`, **only while the Revive-resumed virtual SD print is
+actively printing**:
+
+```gcode
+KLIPPER_REVIVE_XY_ADJUST X=0.1 Y=-0.1
+KLIPPER_REVIVE_Z_ADJUST Z=0.05
+```
+
+During XY/Z alignment, these commands still use the existing manual guided
+moves. During a running recovered print they use Klipper's
+`SET_GCODE_OFFSET X_ADJUST=... Y_ADJUST=... MOVE=1` and
+`SET_GCODE_OFFSET Z_ADJUST=... MOVE=1` instead, with bounded move speeds.
+This updates the G-code coordinate origin as well as the nozzle position;
+there is no independent `toolhead.manual_move` in the print queue. Deltas
+remain **incremental** and accumulate with offsets set in the earlier
+alignment wizard. The configured `max_xy_adjust` (default ±5 mm per axis)
+and `max_z_adjust` (default ±2 mm) bounds still apply to the **total**
+Revive offset, including pre-resume changes. The live commands reject
+non-printing, paused, cancelled, and unrelated new print sessions.
+An unsuccessful live offset move disables subsequent live Revive offsets
+rather than risk losing cumulative-offset accounting.
+
+These are physical changes performed during printing. Apply small steps
+while supervising the print; moving the nozzle into previously printed
+material can damage the part or toolhead. Any new checkpoint also captures
+the Klipper-adjusted logical origin. Offsets applied through non-Revive
+macros or UI controls are not included in the Revive session's cumulative
+offset counter.
 
 At any alignment stage `KLIPPER_REVIVE_CANCEL` stops the wizard **without movement**. Since Klipper's Z reference was manually assigned, restart Klipper before normal printing after cancellation. If the actual nozzle seems lower than expected, do not confirm or jog downward.
 

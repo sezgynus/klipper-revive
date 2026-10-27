@@ -211,6 +211,40 @@ class SmokeTest(unittest.TestCase):
                         .get('status') == 'invalidated')
         self.printer.callbacks['klippy:shutdown']()
 
+    def test_new_file_and_completion_disable_live_offsets(self):
+        self.module.recovery.live_adjustments_enabled = True
+        self.printer.callbacks['virtual_sdcard:reset_file']()
+        self.assertFalse(self.module.recovery.live_adjustments_enabled)
+
+        self.module.recovery.live_adjustments_enabled = True
+        self.printer.stats.state = 'complete'
+        self.printer.reactor.callback(2.)
+        self.assertFalse(self.module.recovery.live_adjustments_enabled)
+        self.printer.callbacks['klippy:shutdown']()
+
+    def test_resume_gcode_speed_argument_defaults_to_ten_percent(self):
+        received = []
+        messages = []
+        self.module.recovery.resume = lambda flag, gcmd=None, speed_percent=10.: (
+            received.append((flag, speed_percent)))
+        class Command:
+            def __init__(self, speed=None):
+                self.speed = speed
+            def get_int(self, name, default, **kwargs):
+                return 1
+            def get_float(self, name, default, **kwargs):
+                assert name == 'SPEED'
+                assert kwargs == {'minval': 1., 'maxval': 200.}
+                return default if self.speed is None else self.speed
+            def respond_info(self, message):
+                messages.append(message)
+        self.module.cmd_resume(Command())
+        self.module.cmd_resume(Command(42.5))
+        self.assertEqual(received, [(True, 10.), (True, 42.5)])
+        self.assertIn('10.0% speed', messages[0])
+        self.assertIn('42.5% speed', messages[1])
+        self.printer.callbacks['klippy:shutdown']()
+
     def test_recovery_internal_reset_does_not_invalidate_interrupted_job(self):
         timer = self.printer.reactor.callback
         timer(1.)

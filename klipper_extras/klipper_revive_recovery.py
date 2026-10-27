@@ -28,6 +28,28 @@ class RecoverySession:
         self.snapshot = None
         self.offsets = [0., 0., 0.]
         self.target = None
+        self.live_adjustments_enabled = False
+
+    def _check_live_print(self):
+        """Allow live offsets only for this active Revive-resumed SD print."""
+        sd = self.printer.lookup_object('virtual_sdcard')
+        stats = self.printer.lookup_object('print_stats')
+        if (self.phase != 'complete' or not self.live_adjustments_enabled
+                or stats.state != 'printing' or not sd.is_active()):
+            raise RecoveryError(
+                'Live offsets require an actively printing Revive-resumed job')
+
+    def _apply_live_offset(self, script):
+        # SET_GCODE_OFFSET queues the relative motion via Klipper's G-code
+        # transform. Avoid toolhead.manual_move during virtual SD printing.
+        try:
+            self._script(script)
+        except Exception:
+            # An offset command can update Klipper's origin before rejecting
+            # the actual physical move; don't let our cumulative safety
+            # accounting become inconsistent on a retry.
+            self.live_adjustments_enabled = False
+            raise
 
     def _check_idle(self):
         stats = self.printer.lookup_object('print_stats')
@@ -170,6 +192,7 @@ class RecoverySession:
                 raise RecoveryError('Saved bed mesh is unavailable; recovery stopped')
         self.snapshot = cp
         self.offsets = [0., 0., 0.]
+        self.live_adjustments_enabled = False
         # Long heater waits happen only after the user explicitly starts recovery.
         self.phase = 'heating'
         try:
@@ -198,20 +221,30 @@ class RecoverySession:
             raise
 
     def adjust_xy(self, dx, dy):
-        if self.phase != 'align_xy':
-            raise RecoveryError('XY alignment is not active')
-        self._check_unexpected_motion()
+        if self.phase not in ('align_xy', 'complete'):
+            raise RecoveryError('XY adjustment is not active')
+        if self.phase == 'complete':
+            self._check_live_print()
+        else:
+            self._check_unexpected_motion()
         if not all(math.isfinite(v) for v in (dx, dy)):
             raise RecoveryError('Nonfinite XY adjustment')
         xoffset = self.offsets[0] + dx
         yoffset = self.offsets[1] + dy
         if abs(xoffset) > self.max_xy_adjust or abs(yoffset) > self.max_xy_adjust:
             raise RecoveryError('XY adjustment exceeds configured safety limit')
-        self._move(x=self.target[0] + dx,
-                   y=self.target[1] + dy,
-                   speed=min(self.xy_speed, 20.))
+        if self.phase == 'complete':
+            if dx or dy:
+                self._apply_live_offset(
+                    'SET_GCODE_OFFSET X_ADJUST=%.6f Y_ADJUST=%.6f '
+                    'MOVE=1 MOVE_SPEED=%.3f'
+                    % (dx, dy, min(self.xy_speed, 20.)))
+        else:
+            self._move(x=self.target[0] + dx,
+                       y=self.target[1] + dy,
+                       speed=min(self.xy_speed, 20.))
+            self.target = self._head().get_position()[:3]
         self.offsets[:2] = [xoffset, yoffset]
-        self.target = self._head().get_position()[:3]
 
     def confirm_xy(self):
         if self.phase != 'align_xy':
@@ -228,14 +261,23 @@ class RecoverySession:
             raise
 
     def adjust_z(self, dz):
-        if self.phase != 'align_z':
-            raise RecoveryError('Z alignment is not active')
-        self._check_unexpected_motion()
+        if self.phase not in ('align_z', 'complete'):
+            raise RecoveryError('Z adjustment is not active')
+        if self.phase == 'complete':
+            self._check_live_print()
+        else:
+            self._check_unexpected_motion()
         if not math.isfinite(dz) or abs(self.offsets[2] + dz) > self.max_z_adjust:
             raise RecoveryError('Z adjustment exceeds configured safety limit')
-        self._move(z=self.target[2] + dz, speed=min(self.z_speed, 1.))
+        if self.phase == 'complete':
+            if dz:
+                self._apply_live_offset(
+                    'SET_GCODE_OFFSET Z_ADJUST=%.6f MOVE=1 MOVE_SPEED=%.3f'
+                    % (dz, min(self.z_speed, 1.)))
+        else:
+            self._move(z=self.target[2] + dz, speed=min(self.z_speed, 1.))
+            self.target = self._head().get_position()[:3]
         self.offsets[2] += dz
-        self.target = self._head().get_position()[:3]
 
     def confirm_z(self):
         if self.phase != 'align_z':
@@ -265,7 +307,11 @@ class RecoverySession:
             self.owner._recovery_reset_in_progress = False
         sd._load_file(gcmd, name, check_subdirs=True)
 
-    def resume(self, acknowledge_external=False, gcmd=None):
+    def resume(self, acknowledge_external=False, gcmd=None, speed_percent=10.):
+        if (not isinstance(speed_percent, (int, float))
+                or not math.isfinite(speed_percent)
+                or not 1. <= speed_percent <= 200.):
+            raise RecoveryError('Resume SPEED must be between 1 and 200 percent')
         if self.phase != 'ready':
             raise RecoveryError('Confirm XY and Z before resuming')
         if not acknowledge_external:
@@ -330,9 +376,13 @@ class RecoverySession:
             # before the first resumed SD G-code command is executed.
             for script in tuning_commands:
                 self._script(script)
+            # A cold-resumed print should start slowly even when its
+            # checkpoint had a higher feedrate override.
+            self._script('M220 S%.3f' % speed_percent)
             self.phase = 'resuming'
             self._script('M24')
             self.phase = 'complete'
+            self.live_adjustments_enabled = True
         except Exception:
             self.phase = 'error'
             raise
@@ -341,5 +391,6 @@ class RecoverySession:
         if self.phase in ('inactive', 'complete'):
             return
         self.phase = 'error'
+        self.live_adjustments_enabled = False
         # Do not rehome or move the nozzle. Z was artificially marked homed.
         # User must RESTART Klipper to restore its normal homing state.

@@ -92,14 +92,28 @@ class FakeSD:
 
 
 class FakeGcode:
-    def __init__(self, head, sd, stats):
+    def __init__(self, head, sd, stats, move):
         self.calls = []
         self.head = head
         self.sd = sd
         self.stats = stats
+        self.move = move
 
     def run_script_from_command(self, script):
         self.calls.append(script)
+        if script.startswith('M220 S'):
+            self.move.speed_factor = float(script.split('S', 1)[1]) / 6000.
+        if script.startswith('SET_GCODE_OFFSET '):
+            parts = dict(part.split('=', 1) for part in script.split()[1:])
+            for i, axis in enumerate('XYZ'):
+                value = parts.get(axis + '_ADJUST')
+                if value is None:
+                    continue
+                delta = float(value)
+                self.move.homing_position[i] += delta
+                self.move.base_position[i] += delta
+                self.move.last_position[i] += delta
+                self.head.pos[i] += delta
         if script == 'G28 X Y':
             self.head.pos[:2] = [0., 0.]
         if script.startswith('M26 S'):
@@ -125,7 +139,7 @@ class FakePrinter:
             'bed_mesh': SimpleNamespace(
                 pmgr=SimpleNamespace(get_profiles=lambda: {'default': {}}))
         }
-        self.gcode = FakeGcode(head, sd, stats)
+        self.gcode = FakeGcode(head, sd, stats, self.objects['gcode_move'])
 
     def lookup_object(self, name, default=None):
         return self.objects.get(name, default)
@@ -189,8 +203,8 @@ class GuidedRecoveryTests(unittest.TestCase):
         messages = []
         session.resume(True, gcmd=SimpleNamespace(respond_raw=messages.append))
         self.assertEqual(session.phase, 'complete')
-        self.assertEqual(self.owner.gcode.calls[-2:],
-                         ['M26 S1234', 'M24'])
+        self.assertEqual(self.owner.gcode.calls[-3:],
+                         ['M26 S1234', 'M220 S10.000', 'M24'])
         sd = self.owner.printer.objects['virtual_sdcard']
         self.assertEqual(sd.open_calls, [('cube.gcode', True, False)])
         self.assertEqual(sd.file_position, 1234)
@@ -217,8 +231,8 @@ class GuidedRecoveryTests(unittest.TestCase):
             ('test/Kup_ABS_12m16s.gcode', True, False)])
         self.assertEqual(sd.file_position, cp['file_position'])
         self.assertTrue(sd.active)
-        self.assertEqual(self.owner.gcode.calls[-2:],
-                         ['M26 S1234', 'M24'])
+        self.assertEqual(self.owner.gcode.calls[-3:],
+                         ['M26 S1234', 'M220 S10.000', 'M24'])
         self.assertEqual(self.owner.unexpected_resets, 0)
         self.assertIn('File selected', messages)
 
@@ -266,7 +280,7 @@ class GuidedRecoveryTests(unittest.TestCase):
         session.confirm_z()
         session.resume(True, gcmd=SimpleNamespace(respond_raw=lambda _: None))
         calls = self.owner.gcode.calls
-        self.assertEqual(calls[-5:], [
+        self.assertEqual(calls[-6:], [
             'M26 S1234',
             'SET_VELOCITY_LIMIT VELOCITY=460.000000000 ACCEL=17500.000000000 '
             'SQUARE_CORNER_VELOCITY=6.500000000 MINIMUM_CRUISE_RATIO=0.250000000',
@@ -275,6 +289,7 @@ class GuidedRecoveryTests(unittest.TestCase):
             'SET_RETRACTION RETRACT_LENGTH=1.600000000 '
             'RETRACT_SPEED=32.000000000 UNRETRACT_EXTRA_LENGTH=0.150000000 '
             'UNRETRACT_SPEED=37.000000000',
+            'M220 S10.000',
             'M24',
         ])
 
@@ -303,8 +318,119 @@ class GuidedRecoveryTests(unittest.TestCase):
         self.session.confirm_xy()
         self.session.confirm_z()
         self.session.resume(True, gcmd=SimpleNamespace(respond_raw=lambda _: None))
-        self.assertEqual(self.owner.gcode.calls[-2:], ['M26 S1234', 'M24'])
+        self.assertEqual(self.owner.gcode.calls[-3:],
+                         ['M26 S1234', 'M220 S10.000', 'M24'])
         self.assertEqual(self.session.phase, 'complete')
+
+    def test_custom_resume_speed_and_speed_factor(self):
+        session = self.session
+        session.prepare()
+        session.confirm_xy()
+        session.confirm_z()
+        session.resume(True, gcmd=SimpleNamespace(respond_raw=lambda _: None),
+                       speed_percent=35.5)
+        self.assertEqual(self.owner.gcode.calls[-3:],
+                         ['M26 S1234', 'M220 S35.500', 'M24'])
+        move = self.owner.printer.objects['gcode_move']
+        self.assertAlmostEqual(move.speed_factor, 35.5 / 6000.)
+        self.assertTrue(session.live_adjustments_enabled)
+
+    def test_resume_speed_validation_prevents_file_selection(self):
+        session = self.session
+        session.prepare()
+        session.confirm_xy()
+        session.confirm_z()
+        for bad in (0., -10., 200.1, float('nan'), float('inf')):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(RecoveryError, 'SPEED'):
+                    session.resume(True,
+                                   gcmd=SimpleNamespace(respond_raw=lambda _: None),
+                                   speed_percent=bad)
+        self.assertEqual(session.phase, 'ready')
+        self.assertEqual(self.owner.printer.objects['virtual_sdcard'].reset_count, 0)
+        self.assertNotIn('M24', self.owner.gcode.calls)
+
+    def test_live_xy_z_offsets_use_gcode_transform_and_accumulate(self):
+        session = self.session
+        session.prepare()
+        session.adjust_xy(.2, -.1)
+        session.confirm_xy()
+        session.adjust_z(.05)
+        session.confirm_z()
+        session.resume(True, gcmd=SimpleNamespace(respond_raw=lambda _: None))
+        head = self.owner.printer.objects['toolhead']
+        move = self.owner.printer.objects['gcode_move']
+        old_count = len(head.moves)
+        old_base = list(move.base_position)
+        old_origin = list(move.homing_position)
+        old_position = list(head.pos)
+        session.adjust_xy(.15, .25)
+        session.adjust_z(.1)
+        self.assertEqual(len(head.moves), old_count)
+        for actual, expected in zip(session.offsets, (.35, .15, .15)):
+            self.assertAlmostEqual(actual, expected)
+        for i, delta in enumerate((.15, .25, .1)):
+            self.assertAlmostEqual(move.base_position[i], old_base[i] + delta)
+            self.assertAlmostEqual(move.homing_position[i], old_origin[i] + delta)
+            self.assertAlmostEqual(head.pos[i], old_position[i] + delta)
+        self.assertEqual(self.owner.gcode.calls[-2:], [
+            'SET_GCODE_OFFSET X_ADJUST=0.150000 Y_ADJUST=0.250000 '
+            'MOVE=1 MOVE_SPEED=20.000',
+            'SET_GCODE_OFFSET Z_ADJUST=0.100000 MOVE=1 MOVE_SPEED=1.000',
+        ])
+        with self.assertRaisesRegex(RecoveryError, 'configured safety limit'):
+            session.adjust_xy(5., 0.)
+        with self.assertRaisesRegex(RecoveryError, 'configured safety limit'):
+            session.adjust_z(2.)
+        for actual, expected in zip(session.offsets, (.35, .15, .15)):
+            self.assertAlmostEqual(actual, expected)
+
+    def test_live_offsets_require_active_resumed_print(self):
+        session = self.session
+        session.prepare()
+        session.confirm_xy()
+        session.confirm_z()
+        session.resume(True, gcmd=SimpleNamespace(respond_raw=lambda _: None))
+        sd = self.owner.printer.objects['virtual_sdcard']
+        stats = self.owner.printer.objects['print_stats']
+        before = list(self.owner.gcode.calls)
+        stats.state = 'paused'
+        with self.assertRaisesRegex(RecoveryError, 'actively printing'):
+            session.adjust_xy(.1, 0.)
+        stats.state = 'complete'
+        with self.assertRaisesRegex(RecoveryError, 'actively printing'):
+            session.adjust_z(.1)
+        stats.state = 'printing'
+        sd.active = False
+        with self.assertRaisesRegex(RecoveryError, 'actively printing'):
+            session.adjust_xy(.1, 0.)
+        sd.active = True
+        session.live_adjustments_enabled = False
+        with self.assertRaisesRegex(RecoveryError, 'actively printing'):
+            session.adjust_z(.1)
+        self.assertEqual(self.owner.gcode.calls, before)
+
+    def test_live_adjust_failure_disables_further_adjustments(self):
+        session = self.session
+        session.prepare()
+        session.confirm_xy()
+        session.confirm_z()
+        session.resume(True, gcmd=SimpleNamespace(respond_raw=lambda _: None))
+        prior = list(session.offsets)
+        old_script = self.owner.gcode.run_script_from_command
+
+        def fail_set_offset(script):
+            if script.startswith('SET_GCODE_OFFSET'):
+                raise RuntimeError('live offset motion rejected')
+            old_script(script)
+
+        self.owner.gcode.run_script_from_command = fail_set_offset
+        with self.assertRaisesRegex(RuntimeError, 'rejected'):
+            session.adjust_z(.1)
+        self.assertEqual(session.offsets, prior)
+        self.assertFalse(session.live_adjustments_enabled)
+        with self.assertRaisesRegex(RecoveryError, 'actively printing'):
+            session.adjust_xy(.1, 0.)
 
     def test_wrong_phase_adjustment_rejected(self):
         with self.assertRaises(RecoveryError):

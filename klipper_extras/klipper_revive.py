@@ -75,6 +75,7 @@ class KlipperRevive:
 
     def _on_stop(self):
         self.enabled = False
+        self.recovery.live_adjustments_enabled = False
         self._remove_sd_completion_hook()
         if self.timer is not None:
             self.reactor.unregister_timer(self.timer)
@@ -100,6 +101,8 @@ class KlipperRevive:
             # Revive reselects the *same* interrupted job before M26/M24.
             # Do not tombstone the checkpoint during its internal file load.
             return
+        # A manually selected new print must not inherit Revive live offsets.
+        self.recovery.live_adjustments_enabled = False
         # SDCARD_PRINT_FILE, M23 and SDCARD_RESET_FILE reset VirtualSD.
         # The old checkpoint must not be exposed even while the background
         # writer is still persisting the invalidation tombstone.
@@ -194,6 +197,7 @@ class KlipperRevive:
                 self.closed_job = False
                 self._capture_if_due(eventtime)
             elif state in ('complete', 'cancelled'):
+                self.recovery.live_adjustments_enabled = False
                 if not self.closed_job:
                     self.writer.submit({'schema': 1, 'status': state,
                                         'job_id': self._session_id})
@@ -270,9 +274,11 @@ class KlipperRevive:
 
     def cmd_resume(self, gcmd):
         acknowledge = gcmd.get_int('EXTERNAL_STATE_OK', 0, minval=0, maxval=1)
+        speed = gcmd.get_float('SPEED', 10., minval=1., maxval=200.)
         self._recover_call(gcmd, lambda: self.recovery.resume(
-            acknowledge == 1, gcmd=gcmd))
-        gcmd.respond_info('Revive: resumed virtual SD print.')
+            acknowledge == 1, gcmd=gcmd, speed_percent=speed))
+        gcmd.respond_info('Revive: resumed virtual SD print at %.1f%% speed.'
+                          % speed)
 
     def cmd_cancel(self, gcmd):
         self.recovery.cancel()
