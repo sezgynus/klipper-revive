@@ -4,6 +4,7 @@ No motion occurs without an explicit user-issued recovery command.
 """
 import logging
 import os
+import re
 import uuid
 
 from .klipper_revive_collect import StateCollector
@@ -17,15 +18,15 @@ class KlipperRevive:
         self.reactor = self.printer.get_reactor()
         self.gcode = self.printer.lookup_object('gcode')
         self.sample_interval = config.getfloat('sample_interval', 1.0, above=0.)
-        self.checkpoint_interval = config.getfloat('checkpoint_interval', 15.0,
-                                                    above=0.)
+        # Accept the former config option for upgrades, but event-based
+        # checkpoints are never gated by an elapsed-time interval.
+        config.getfloat('checkpoint_interval', 15.0, above=0.)
         path = config.get('checkpoint_dir',
                           os.path.expanduser('~/printer_data/klipper_revive'))
         self.store = CheckpointStore(os.path.expanduser(path))
         self.writer = CheckpointWriter(self.store)
         self.collector = None
         self.timer = None
-        self.next_checkpoint = 0.
         self._sd_dispatch_original = None
         self._sd_dispatch_wrapper = None
         self._script_depth = 0
@@ -85,7 +86,6 @@ class KlipperRevive:
     def _begin_job(self, invalidate_previous=True):
         """Fence off earlier print sessions, even for the same G-code path."""
         self._session_id = uuid.uuid4().hex
-        self.next_checkpoint = 0.
         self.closed_job = False
         if invalidate_previous:
             # This tombstone is queued *before* any new job's snapshots.
@@ -119,34 +119,46 @@ class KlipperRevive:
             return None
         return checkpoint
 
-    def _install_sd_completion_hook(self):
-        """Observe successful file-command boundaries without modifying Klipper.
+    # Only G-code that requests movement creates a new checkpoint.
+    # G10/G11 are the standard firmware retraction (E axis) commands.
+    # G28 homing also moves axes. Ignore comments, M104, etc.
+    _MOVEMENT_COMMAND = re.compile(
+        r'^(?:N[0-9]+\s+)?(?:G0|G1|G2|G3|G10|G11|G28)(?=\s|$)',
+        re.IGNORECASE)
 
-        VirtualSD runs gcode.run_script(line) while cmd_from_sd=True, then
-        advances file_position to next_file_position. Timers frequently fire
-        INSIDE a yieldable command; post-command capture is the stable point.
+    @classmethod
+    def _is_motion_line(cls, script):
+        line = script.split(';', 1)[0].strip()
+        return bool(cls._MOVEMENT_COMMAND.match(line))
+
+    def _install_sd_completion_hook(self):
+        """Capture the PRE-command position at every SD movement line.
+
+        VirtualSD updates next_file_position before dispatch but file_position
+        still points at the start of the current line. Capture before calling
+        the original G-code handler, so a restart reprocesses that line.
+        Nested scripts are never independent virtual-SD file boundaries.
         """
         if self._sd_dispatch_wrapper is not None:
             return
         original = self.gcode.run_script
 
         def run_script_with_checkpoint(script):
+            top_level_sd_motion = (
+                self._script_depth == 0 and self.enabled
+                and self.collector is not None
+                and self.collector.sd.cmd_from_sd
+                and self._is_motion_line(script))
+            if top_level_sd_motion:
+                try:
+                    self._capture_motion_start(self.reactor.monotonic())
+                except Exception:
+                    # A failed checkpoint must not alter G-code execution.
+                    logging.exception('Klipper Revive motion checkpoint failed')
+                    self.enabled = False
             self._script_depth += 1
             try:
-                result = original(script)
-                # Nested scripts/macros aren't complete SD file lines.
-                if (self._script_depth == 1 and self.enabled
-                        and self.collector is not None
-                        and self.collector.sd.cmd_from_sd):
-                    try:
-                        self._capture_if_due(self.reactor.monotonic(),
-                                             after_sd_command=True)
-                    except Exception:
-                        # Checkpoint failures must not change Klipper's
-                        # handling of a successfully executed G-code line.
-                        logging.exception('Klipper Revive command checkpoint failed')
-                        self.enabled = False
-                return result
+                return original(script)
             finally:
                 self._script_depth -= 1
 
@@ -161,31 +173,26 @@ class KlipperRevive:
             self._sd_dispatch_wrapper = None
             self._sd_dispatch_original = None
 
-    def _capture_if_due(self, eventtime, after_sd_command=False):
+    def _capture_motion_start(self, eventtime):
+        """Submit a checkpoint for each movement G-code before dispatch."""
         if not self.enabled or self.writer.last_error is not None:
             self.enabled = False
             return
-        if eventtime < self.next_checkpoint:
-            return
-        snapshot = self.collector.capture(eventtime,
-                                          after_sd_command=after_sd_command)
+        snapshot = self.collector.capture(eventtime, at_motion_start=True)
         if snapshot is None:
             return
         if self._session_id is None:
-            # Defensive fallback for nonstandard SD implementations that
-            # did not emit virtual_sdcard:reset_file.
+            # Some VirtualSD implementations do not emit reset_file.
             self._begin_job(invalidate_previous=self.writer.last_saved is not None)
         if not self.enabled:
             return
         snapshot['job_id'] = self._session_id
         previous = self._recoverable_checkpoint()
-        # Don't save the same/older byte offset, including a timer sample
-        # that races with the checkpoint worker's latest pending snapshot.
-        if (previous is None or previous.get('status') != 'printing'
-                or snapshot['file'].get('path') != previous['file'].get('path')
+        # No interval gate. Only disregard duplicate/older byte positions.
+        if (previous is None or snapshot['file']['path'] != previous['file']['path']
                 or snapshot['file_position'] > previous['file_position']):
-            self.writer.submit(snapshot)
-        self.next_checkpoint = eventtime + self.checkpoint_interval
+            if not self.writer.submit(snapshot):
+                self.enabled = False
 
     def _sample(self, eventtime):
         if not self.enabled or self.writer.last_error is not None:
@@ -195,7 +202,6 @@ class KlipperRevive:
             state = self.collector.stats.state
             if state == 'printing':
                 self.closed_job = False
-                self._capture_if_due(eventtime)
             elif state in ('complete', 'cancelled'):
                 self.recovery.live_adjustments_enabled = False
                 if not self.closed_job:
@@ -305,7 +311,7 @@ class KlipperRevive:
         mtime = checkpoint['file'].get('mtime_ns')
         if mtime is not None and stat.st_mtime_ns != mtime:
             return False, 'G-code file modification time changed'
-        if not 0 < checkpoint['file_position'] < stat.st_size:
+        if not 0 <= checkpoint['file_position'] < stat.st_size:
             return False, 'Invalid G-code byte position'
         return True, 'Checkpoint and source file validated (no motion performed)'
 

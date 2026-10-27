@@ -28,7 +28,7 @@ The installer:
 
 No `SAVE_VARIABLE`, extra Python package, or dedicated service is installed. A single daemon writer thread is activated **only when there is a checkpoint to write**. A symlink stays valid when Moonraker updates repository contents. **Do not edit tracked files in the Git checkout**; Moonraker requires a clean repo to update.
 
-The module offers `KLIPPER_REVIVE_STATUS`, `KLIPPER_REVIVE_INSPECT`, `KLIPPER_REVIVE_VALIDATE` and the explicit recovery commands described below. Checkpoints are sampled at completed virtual SD G-code line boundaries when 15 seconds have elapsed, with a 1-second timer as a fallback for idle gaps. The line-boundary observer wraps Klipper's `gcode.run_script` at startup and restores it on shutdown; it never changes any command's outcome or motor state. This avoids sampling only in the middle of a command while `virtual_sdcard.cmd_from_sd` is set. A bounded two-slot checkpoint store keeps the last valid checkpoint with a SHA-256 digest and atomic replacement. All `stat`, serialization, and disk flush operations run in a worker thread. Normal printing never causes recovery motion. Physical recovery movement occurs only when the user sends recovery commands.
+The module offers `KLIPPER_REVIVE_STATUS`, `KLIPPER_REVIVE_INSPECT`, `KLIPPER_REVIVE_VALIDATE` and the explicit recovery commands described below. **Checkpoint capture is event-based:** just before Klipper dispatches each virtual SD movement command (`G0/G1/G2/G3/G10/G11/G28`), Revive captures the current G-code/extrusion state and the **starting byte** of that command. Non-motion G-code does not create a checkpoint; its changed settings appear in the next movement checkpoint. The observer wraps Klipper's `gcode.run_script` at startup and restores it on shutdown. A 1-second reactor timer remains only for completed/cancelled job lifecycle tracking, not for checkpoint capture. A bounded two-slot checkpoint store keeps the last **persisted** snapshot with a SHA-256 digest and atomic replacement. All filesystem metadata checks, serialization, and disk flush operations run in a background writer; when movements are faster than storage, pending snapshots are coalesced to the latest, so a sudden shutdown can leave the last durable checkpoint behind the latest captured movement. No motion is initiated by the checkpoint logic. Physical recovery motion requires explicit operator commands.
 
 ### Custom installations
 
@@ -105,13 +105,13 @@ KLIPPER_REVIVE_STATUS
 KLIPPER_REVIVE_INSPECT
 ```
 
-After 15–20 seconds of movement, `checkpoint=True` and `seq>=1` should be reported (exact timing depends on the first sample). The file and byte position should advance over later samples. Compare `KLIPPER_REVIVE_STATUS` `pos` with Klipper's own `M27` SD byte position at least twice 30 seconds apart: the Revive checkpoint should advance. A nonzero lag is normal due to the 15-second interval and queued moves, but a position frozen across minutes while `M27` advances indicates failure and must be fixed **before any recovery experiment**. Check the on-disk files in `~/printer_data/klipper_revive/checkpoint.[01].json`.
+After the first virtual SD movement command, `checkpoint=True` and `seq>=1` should appear once its asynchronous disk write completes. The `pos` field points to the **start** of the movement command captured by the latest *persisted* checkpoint. Compare `KLIPPER_REVIVE_STATUS` with `M27`: it will naturally trail the file reader, and rapid movements may outpace the disk writer. The checkpoint must continue advancing during an ongoing print. Check the on-disk files at `~/printer_data/klipper_revive/checkpoint.[01].json`.
 
 **New-print isolation:** selecting/resetting a virtual SD print starts a new
 checkpoint session, even if the G-code filename has not changed. An older
 checkpoint is hidden from STATUS, INSPECT, VALIDATE and attended recovery as
-soon as the new print is selected, before the first new 15-second checkpoint
-is taken. The former session is invalidated in background storage before
+soon as the new print is selected, before its first movement checkpoint
+is persisted. The former session is invalidated in background storage before
 the new session's checkpoints are queued. A genuine interruption followed by
 a Klipper restart does not itself invalidate the saved checkpoint; it remains
 available until a *new* file-selection/reset event. As with every asynchronous
@@ -125,9 +125,9 @@ Configuration options in `klipper_revive.cfg`:
 
 ```ini
 [klipper_revive]
-# sample_interval: 1.0
-# checkpoint_interval: 15.0
+# sample_interval: 1.0        # Lifecycle checks only
 # checkpoint_dir: ~/printer_data/klipper_revive
+# checkpoint_interval: 15.0    # Deprecated; accepted but ignored
 ```
 
 Read the live module status using Moonraker's `klipper_revive` status object as well. The saved file path and modified time are validated on explicit request; inspection does not move any motors or change heaters.
@@ -146,10 +146,10 @@ configuration defaults):
 
 The `minimum_cruise_ratio` value is stored as a fraction: the UI's **50%**
 corresponds to **0.5** in the checkpoint and recovery command. These values
-are read on every *scheduled checkpoint* and restored after the saved SD byte
-position is selected, **before** issuing `M24`. Recording still uses the
-15-second checkpoint interval; this change does not implement a checkpoint for
-every G-code line or guarantee exact physical-motion synchronization.
+are read at each movement-command start and restored after the saved SD byte
+position is selected, **before** issuing `M24`. The resumed file starts by
+reprocessing the movement G-code line recorded in the persisted checkpoint,
+rather than skipping it.
 
 Firmware retraction is optional; it is not saved when the module is absent.
 When a checkpoint contains this setting but the module is missing at recovery,

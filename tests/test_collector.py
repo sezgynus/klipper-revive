@@ -78,7 +78,8 @@ class CollectorTests(unittest.TestCase):
         self.collector = StateCollector(self.printer)
 
     def test_capture_whitelisted_fields(self):
-        state = self.collector.capture(1.0)
+        self.printer.sd.cmd_from_sd = True
+        state = self.collector.capture(1.0, at_motion_start=True)
         self.assertEqual(state['file_position'], 100)
         self.assertEqual(state['heater_targets'], {'extruder': 215, 'heater_bed': 60})
         self.assertEqual(state['fan_speeds'], {'fan': .7})
@@ -104,7 +105,8 @@ class CollectorTests(unittest.TestCase):
         self.printer.values['firmware_retraction'].values.update(
             retract_length=1.4, retract_speed=31.,
             unretract_extra_length=.2, unretract_speed=38.)
-        snapshot = self.collector.capture(2.)
+        self.printer.sd.cmd_from_sd = True
+        snapshot = self.collector.capture(2., at_motion_start=True)
         self.assertEqual(snapshot['motion_limits']['max_accel'], 8700.)
         self.assertEqual(snapshot['motion_limits']['minimum_cruise_ratio'], .2)
         self.assertEqual(snapshot['pressure_advance']['advance'], .095)
@@ -116,52 +118,61 @@ class CollectorTests(unittest.TestCase):
         self.printer.values.pop('firmware_retraction')
         self.printer.values['extruder'].values.pop('pressure_advance')
         self.collector.refresh_objects()
-        snapshot = self.collector.capture(1.)
+        self.printer.sd.cmd_from_sd = True
+        snapshot = self.collector.capture(1., at_motion_start=True)
         self.assertNotIn('firmware_retraction', snapshot)
         self.assertNotIn('pressure_advance', snapshot)
         self.assertIn('motion_limits', snapshot)
 
-    def test_paused_or_executing_skipped(self):
+    def test_capture_only_during_sd_motion_entry(self):
+        sd = self.printer.sd
+        self.assertIsNone(self.collector.capture(0., at_motion_start=True))
+        sd.cmd_from_sd = True
+        self.assertIsNotNone(self.collector.capture(0., at_motion_start=True))
+        self.assertIsNone(self.collector.capture(0.))
         self.printer.stats.state = 'paused'
-        self.assertIsNone(self.collector.capture(0))
-        self.printer.stats.state = 'printing'
-        self.printer.sd.cmd_from_sd = True
-        self.assertIsNone(self.collector.capture(0))
-        self.printer.sd.cmd_from_sd = False
+        self.assertIsNone(self.collector.capture(0., at_motion_start=True))
 
-    def test_completed_sd_line_uses_next_position_not_stale_position(self):
+    def test_motion_entry_uses_line_start_not_next_byte(self):
         sd = self.printer.sd
         sd.cmd_from_sd = True
         sd.file_position = 100
         sd.next_file_position = 280
-        self.assertIsNone(self.collector.capture(1.0))
-        state = self.collector.capture(1.0, after_sd_command=True)
-        self.assertEqual(state['file_position'], 280)
-        self.assertEqual(sd.file_position, 100)
+        snapshot = self.collector.capture(1., at_motion_start=True)
+        self.assertEqual(snapshot['file_position'], 100)
+        self.assertNotEqual(snapshot['file_position'], 280)
 
-    def test_completed_line_rejects_position_change_during_capture(self):
+    def test_motion_entry_at_file_byte_zero_is_valid(self):
         sd = self.printer.sd
         sd.cmd_from_sd = True
-        sd.next_file_position = 280
+        sd.file_position = 0
+        sd.next_file_position = 15
+        snapshot = self.collector.capture(1., at_motion_start=True)
+        self.assertEqual(snapshot['file_position'], 0)
+
+    def test_capture_rejects_sd_byte_advancement(self):
+        sd = self.printer.sd
+        sd.cmd_from_sd = True
         original = self.collector.move.get_status
 
         def progress_during_capture(eventtime):
-            sd.next_file_position = 450
+            sd.file_position += 10
             return original(eventtime)
 
         self.collector.move.get_status = progress_during_capture
-        self.assertIsNone(self.collector.capture(1.0, after_sd_command=True))
+        self.assertIsNone(self.collector.capture(1., at_motion_start=True))
 
-    def test_completed_line_rejects_invalid_phase(self):
-        self.assertIsNone(self.collector.capture(1.0, after_sd_command=True))
+    def test_capture_rejects_stopped_sd_dispatch(self):
+        sd = self.printer.sd
+        sd.cmd_from_sd = True
+        original = self.collector.move.get_status
 
-    def test_skip_changed_file_position(self):
-        old = self.collector.move.get_status
-        def advance(eventtime):
-            self.printer.sd.file_position += 10
-            return old(eventtime)
-        self.collector.move.get_status = advance
-        self.assertIsNone(self.collector.capture(0))
+        def stopped_during_capture(eventtime):
+            sd.cmd_from_sd = False
+            return original(eventtime)
+
+        self.collector.move.get_status = stopped_during_capture
+        self.assertIsNone(self.collector.capture(1., at_motion_start=True))
 
 
 if __name__ == '__main__':
