@@ -127,6 +127,34 @@ Configuration options in `klipper_revive.cfg`:
 
 Read the live module status using Moonraker's `klipper_revive` status object as well. The saved file path and modified time are validated on explicit request; inspection does not move any motors or change heaters.
 
+### Live tuning saved in each checkpoint
+
+When Klipper exposes the corresponding objects, each **new** checkpoint also
+captures the dynamically adjusted settings below (rather than only their
+configuration defaults):
+
+| UI values | Klipper status source | Recovery command |
+| --- | --- | --- |
+| Pressure Advance, Smooth Time | Active `extruder` (`pressure_advance`, `smooth_time`) | `SET_PRESSURE_ADVANCE EXTRUDER=... ADVANCE=... SMOOTH_TIME=...` |
+| Retraction length/speed, unretract extra length/speed | Optional `firmware_retraction` | `SET_RETRACTION RETRACT_LENGTH=... RETRACT_SPEED=... UNRETRACT_EXTRA_LENGTH=... UNRETRACT_SPEED=...` |
+| Max velocity, max acceleration, square corner velocity, minimum cruise ratio | `toolhead` | `SET_VELOCITY_LIMIT VELOCITY=... ACCEL=... SQUARE_CORNER_VELOCITY=... MINIMUM_CRUISE_RATIO=...` |
+
+The `minimum_cruise_ratio` value is stored as a fraction: the UI's **50%**
+corresponds to **0.5** in the checkpoint and recovery command. These values
+are read on every *scheduled checkpoint* and restored after the saved SD byte
+position is selected, **before** issuing `M24`. Recording still uses the
+15-second checkpoint interval; this change does not implement a checkpoint for
+every G-code line or guarantee exact physical-motion synchronization.
+
+Firmware retraction is optional; it is not saved when the module is absent.
+When a checkpoint contains this setting but the module is missing at recovery,
+Revive rejects recovery before heating/motion rather than silently ignoring it.
+Older checkpoints lacking these fields remain loadable and do not overwrite
+current tuning. The firmware retraction module's transient `is_retracted`
+flag is not exposed in its public status and is **not reconstructed**;
+externally controlled tool/filament state still requires operator verification.
+
+
 ### Experimental recovery wizard (supervised test only)
 
 Recovery is **opt-in**: it never begins after boot by itself. After a failed print, ensure the hotend is in a safe position and axes can move. The saved machine Z is trusted *without Z homing*; this is valid only if Z has not mechanically shifted since the last checkpoint. If Z motors lost steps or the gantry moved, **do not start recovery**.
@@ -161,7 +189,7 @@ Recovery is **opt-in**: it never begins after boot by itself. After a failed pri
    KLIPPER_REVIVE_RESUME EXTERNAL_STATE_OK=1
    ```
 
-This restores standard captured coordinate/extrusion modes, speeds, bed mesh **only if a named persisted profile is available**, regular/generic fan speeds, saved active extruder and bed/nozzle targets. It selects the same G-code file (including a file in a virtual SD subdirectory) without starting the print, seeks to the recorded byte position, and only then starts virtual SD printing. Klipper's `M23` command cannot search subdirectories; recovery uses the same subdirectory-aware file loader as `SDCARD_PRINT_FILE` without its automatic start. This internal file reset is not treated as a *new* print session, so it does not invalidate the very checkpoint being recovered. The next queued G-code may repeat part of an already printed segment.
+This restores standard captured coordinate/extrusion modes, speeds, bed mesh **only if a named persisted profile is available**, regular/generic fan speeds, saved active extruder and bed/nozzle targets. It selects the same G-code file (including a file in a virtual SD subdirectory) without starting the print, seeks to the recorded byte position, and only then starts virtual SD printing. Klipper's `M23` command cannot search subdirectories; recovery uses the same subdirectory-aware file loader as `SDCARD_PRINT_FILE` without its automatic start. This internal file reset is not treated as a *new* print session, so it does not invalidate the very checkpoint being recovered. Any saved dynamic motion limits, pressure advance, and firmware retraction parameters are validated and restored **before** the first resumed SD G-code command. The next queued G-code may repeat part of an already printed segment.
 
 At any alignment stage `KLIPPER_REVIVE_CANCEL` stops the wizard **without movement**. Since Klipper's Z reference was manually assigned, restart Klipper before normal printing after cancellation. If the actual nozzle seems lower than expected, do not confirm or jog downward.
 

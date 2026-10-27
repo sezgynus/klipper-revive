@@ -29,6 +29,7 @@ class StateCollector:
         self.heaters = []
         self.fans = []
         self.mesh = None
+        self.firmware_retraction = None
         self.refresh_objects()
 
     def refresh_objects(self):
@@ -40,6 +41,8 @@ class StateCollector:
         self.fans = [(name, obj) for name, obj in objects
                      if name == 'fan' or name.startswith('fan_generic ')]
         self.mesh = self.printer.lookup_object('bed_mesh', None)
+        self.firmware_retraction = self.printer.lookup_object(
+            'firmware_retraction', None)
 
     def capture(self, eventtime, after_sd_command=False):
         """Capture a matching G-code state and byte boundary.
@@ -67,6 +70,30 @@ class StateCollector:
         gc = self.move.get_status(eventtime)
         machine = [number(v) for v in self.toolhead.get_position()[:4]]
         extruder = self.toolhead.get_extruder().get_name()
+        # Live tuning may change via G-code, UI, macros, or filament profiles.
+        # Read it only when a checkpoint is due, not on every SD command.
+        toolhead_status = self.toolhead.get_status(eventtime)
+        limit_keys = ('max_velocity', 'max_accel',
+                      'square_corner_velocity', 'minimum_cruise_ratio')
+        motion_limits = None
+        if all(key in toolhead_status for key in limit_keys):
+            motion_limits = {key: number(toolhead_status[key])
+                             for key in limit_keys}
+        extruder_status = self.printer.lookup_object(extruder).get_status(eventtime)
+        pressure_advance = None
+        if 'pressure_advance' in extruder_status and 'smooth_time' in extruder_status:
+            pressure_advance = {
+                'advance': number(extruder_status['pressure_advance']),
+                'smooth_time': number(extruder_status['smooth_time']),
+            }
+        firmware_retraction = None
+        if self.firmware_retraction is not None:
+            retract_status = self.firmware_retraction.get_status(eventtime)
+            retract_keys = ('retract_length', 'retract_speed',
+                            'unretract_extra_length', 'unretract_speed')
+            if all(key in retract_status for key in retract_keys):
+                firmware_retraction = {key: number(retract_status[key])
+                                       for key in retract_keys}
         heat = {}
         for name, obj in self.heaters:
             status = obj.get_status(eventtime)
@@ -84,7 +111,7 @@ class StateCollector:
                 or int(getattr(self.sd, position_field)) != before
                 or self.sd.file_path() != path):
             return None
-        return {
+        snapshot = {
             'schema': SCHEMA_VERSION,
             'status': 'printing',
             'file': {'path': str(path), 'size': size},
@@ -105,3 +132,10 @@ class StateCollector:
             'fan_speeds': fan,
             'mesh_profile': mesh_name,
         }
+        if motion_limits is not None:
+            snapshot['motion_limits'] = motion_limits
+        if pressure_advance is not None:
+            snapshot['pressure_advance'] = pressure_advance
+        if firmware_retraction is not None:
+            snapshot['firmware_retraction'] = firmware_retraction
+        return snapshot

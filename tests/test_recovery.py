@@ -26,6 +26,9 @@ class FakeHead:
     def get_position(self):
         return list(self.pos)
 
+    def get_status(self, eventtime):
+        return {'minimum_cruise_ratio': .5}
+
     def set_position(self, newpos, homing_axes=''):
         assert homing_axes == 'z'
         self.pos[:3] = newpos[:3]
@@ -114,6 +117,11 @@ class FakePrinter:
         self.objects = {
             'toolhead': head, 'virtual_sdcard': sd,
             'print_stats': stats, 'gcode_move': FakeMove(head),
+            'extruder': SimpleNamespace(get_status=lambda _: {
+                'pressure_advance': .0, 'smooth_time': .04}),
+            'firmware_retraction': SimpleNamespace(get_status=lambda _: {
+                'retract_length': 1., 'retract_speed': 50.,
+                'unretract_extra_length': 0., 'unretract_speed': 50.}),
             'bed_mesh': SimpleNamespace(
                 pmgr=SimpleNamespace(get_profiles=lambda: {'default': {}}))
         }
@@ -240,6 +248,63 @@ class GuidedRecoveryTests(unittest.TestCase):
         sd = self.owner.printer.objects['virtual_sdcard']
         self.assertEqual(sd.reset_count, 0)
         self.assertNotIn('M24', self.owner.gcode.calls)
+
+    def test_restores_dynamic_tuning_before_start(self):
+        cp = self.owner.snapshot
+        cp['motion_limits'] = {
+            'max_velocity': 460., 'max_accel': 17500.,
+            'square_corner_velocity': 6.5, 'minimum_cruise_ratio': .25,
+        }
+        cp['pressure_advance'] = {'advance': .0925, 'smooth_time': .055}
+        cp['firmware_retraction'] = {
+            'retract_length': 1.6, 'retract_speed': 32.,
+            'unretract_extra_length': .15, 'unretract_speed': 37.,
+        }
+        session = self.session
+        session.prepare()
+        session.confirm_xy()
+        session.confirm_z()
+        session.resume(True, gcmd=SimpleNamespace(respond_raw=lambda _: None))
+        calls = self.owner.gcode.calls
+        self.assertEqual(calls[-5:], [
+            'M26 S1234',
+            'SET_VELOCITY_LIMIT VELOCITY=460.000000000 ACCEL=17500.000000000 '
+            'SQUARE_CORNER_VELOCITY=6.500000000 MINIMUM_CRUISE_RATIO=0.250000000',
+            'SET_PRESSURE_ADVANCE EXTRUDER=extruder ADVANCE=0.092500000 '
+            'SMOOTH_TIME=0.055000000',
+            'SET_RETRACTION RETRACT_LENGTH=1.600000000 '
+            'RETRACT_SPEED=32.000000000 UNRETRACT_EXTRA_LENGTH=0.150000000 '
+            'UNRETRACT_SPEED=37.000000000',
+            'M24',
+        ])
+
+    def test_invalid_tuning_fails_before_heat_or_motion(self):
+        self.owner.snapshot['motion_limits'] = {
+            'max_velocity': 500., 'max_accel': -1.,
+            'square_corner_velocity': 5., 'minimum_cruise_ratio': .5,
+        }
+        with self.assertRaisesRegex(RecoveryError, 'max_accel'):
+            self.session.prepare()
+        self.assertEqual(self.owner.gcode.calls, [])
+        self.assertEqual(self.owner.printer.objects['toolhead'].moves, [])
+
+    def test_missing_firmware_retraction_blocks_incompatible_recovery(self):
+        self.owner.snapshot['firmware_retraction'] = {
+            'retract_length': 1., 'retract_speed': 50.,
+            'unretract_extra_length': 0., 'unretract_speed': 50.,
+        }
+        self.owner.printer.objects.pop('firmware_retraction')
+        with self.assertRaisesRegex(RecoveryError, 'unavailable'):
+            self.session.prepare()
+        self.assertEqual(self.owner.gcode.calls, [])
+
+    def test_legacy_checkpoint_without_tuning_still_resumes(self):
+        self.session.prepare()
+        self.session.confirm_xy()
+        self.session.confirm_z()
+        self.session.resume(True, gcmd=SimpleNamespace(respond_raw=lambda _: None))
+        self.assertEqual(self.owner.gcode.calls[-2:], ['M26 S1234', 'M24'])
+        self.assertEqual(self.session.phase, 'complete')
 
     def test_wrong_phase_adjustment_rejected(self):
         with self.assertRaises(RecoveryError):

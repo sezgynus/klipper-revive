@@ -55,6 +55,85 @@ class RecoverySession:
     def _script(self, script):
         self.gcode.run_script_from_command(script)
 
+    @staticmethod
+    def _setting(settings, key, minimum, maximum=None, strict_min=False,
+                 strict_max=False):
+        try:
+            value = float(settings[key])
+        except (TypeError, ValueError, KeyError):
+            raise RecoveryError('Missing or invalid checkpoint tuning: %s' % key)
+        if (not math.isfinite(value)
+                or (value <= minimum if strict_min else value < minimum)
+                or (maximum is not None and (
+                    value >= maximum if strict_max else value > maximum))):
+            raise RecoveryError('Out-of-range checkpoint tuning: %s' % key)
+        return value
+
+    def _tuning_commands(self, cp):
+        """Validate optional saved dynamic tuning before recovery motion.
+
+        Older checkpoint schemas may omit these groups. Never substitute
+        live values for fields that a checkpoint claims to contain.
+        """
+        commands = []
+        limits = cp.get('motion_limits')
+        if limits is not None:
+            if not isinstance(limits, dict):
+                raise RecoveryError('Invalid checkpoint motion limits')
+            saved = [
+                self._setting(limits, 'max_velocity', 0., strict_min=True),
+                self._setting(limits, 'max_accel', 0., strict_min=True),
+                self._setting(limits, 'square_corner_velocity', 0.),
+                self._setting(limits, 'minimum_cruise_ratio', 0., 1.,
+                              strict_max=True),
+            ]
+            status = self._head().get_status(self.owner.reactor.monotonic())
+            if 'minimum_cruise_ratio' not in status:
+                raise RecoveryError('Klipper does not support saved cruise ratio')
+            commands.append(
+                'SET_VELOCITY_LIMIT VELOCITY=%.9f ACCEL=%.9f '
+                'SQUARE_CORNER_VELOCITY=%.9f MINIMUM_CRUISE_RATIO=%.9f'
+                % tuple(saved))
+        pa = cp.get('pressure_advance')
+        if pa is not None:
+            if not isinstance(pa, dict):
+                raise RecoveryError('Invalid checkpoint pressure advance')
+            advance = self._setting(pa, 'advance', 0.)
+            smooth = self._setting(pa, 'smooth_time', 0., .2)
+            name = cp['extruder']
+            if not re.fullmatch(r'extruder[0-9]*', name):
+                raise RecoveryError('Invalid saved extruder name')
+            obj = self.printer.lookup_object(name, None)
+            status = obj.get_status(self.owner.reactor.monotonic()) if obj else {}
+            if 'pressure_advance' not in status or 'smooth_time' not in status:
+                raise RecoveryError('Saved extruder does not support pressure advance')
+            commands.append(
+                'SET_PRESSURE_ADVANCE EXTRUDER=%s ADVANCE=%.9f SMOOTH_TIME=%.9f'
+                % (name, advance, smooth))
+        retract = cp.get('firmware_retraction')
+        if retract is not None:
+            if not isinstance(retract, dict):
+                raise RecoveryError('Invalid checkpoint firmware retraction')
+            fields = (
+                ('RETRACT_LENGTH', 'retract_length', 0.),
+                ('RETRACT_SPEED', 'retract_speed', 1.),
+                ('UNRETRACT_EXTRA_LENGTH', 'unretract_extra_length', 0.),
+                ('UNRETRACT_SPEED', 'unretract_speed', 1.),
+            )
+            saved = [self._setting(retract, key, minimum)
+                     for _, key, minimum in fields]
+            obj = self.printer.lookup_object('firmware_retraction', None)
+            if obj is None or not callable(getattr(obj, 'get_status', None)):
+                raise RecoveryError('Saved firmware retraction module is unavailable')
+            status = obj.get_status(self.owner.reactor.monotonic())
+            if any(key not in status for _, key, _ in fields):
+                raise RecoveryError('Firmware retraction interface has changed')
+            commands.append(
+                'SET_RETRACTION ' + ' '.join(
+                    '%s=%.9f' % (field[0], value)
+                    for field, value in zip(fields, saved)))
+        return commands
+
     def prepare(self):
         if self.phase != 'inactive':
             raise RecoveryError('Recovery already active; cancel or restart Klipper')
@@ -63,6 +142,7 @@ class RecoverySession:
         if not ok:
             raise RecoveryError(message)
         cp = self.owner.writer.last_saved
+        self._tuning_commands(cp)  # Fail before any heating or recovery motion.
         kin = self._head().get_kinematics()
         if type(kin).__name__ not in ('CartKinematics', 'CoreXYKinematics'):
             raise RecoveryError('Recovery currently supports Cartesian and CoreXY only')
@@ -204,6 +284,7 @@ class RecoverySession:
         name = os.path.relpath(cp['file']['path'], sd.sdcard_dirname)
         if any(ch in name for ch in ('\n', '\r', ';')):
             raise RecoveryError('Invalid resume filename')
+        tuning_commands = self._tuning_commands(cp)
         self.phase = 'restoring'
         try:
             # Restore persistent named mesh before calculating the logical
@@ -245,6 +326,10 @@ class RecoverySession:
             # subsequent moves using the calculated base_position.
             self._open_resume_file(sd, gcmd, name)
             self._script('M26 S%d' % cp['file_position'])
+            # Restore speed/acceleration, PA and firmware retract settings
+            # before the first resumed SD G-code command is executed.
+            for script in tuning_commands:
+                self._script(script)
             self.phase = 'resuming'
             self._script('M24')
             self.phase = 'complete'

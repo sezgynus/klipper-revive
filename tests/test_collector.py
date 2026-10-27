@@ -36,8 +36,18 @@ class Move:
 
 
 class Head:
+    def __init__(self):
+        self.limits = {
+            'max_velocity': 500., 'max_accel': 20000.,
+            'square_corner_velocity': 5., 'minimum_cruise_ratio': .5,
+        }
+
     def get_position(self):
         return [1.0, 2.0, 3.0, 4.0]
+
+    def get_status(self, eventtime):
+        return self.limits
+
     def get_extruder(self):
         return SimpleNamespace(get_name=lambda: 'extruder')
 
@@ -49,7 +59,11 @@ class Printer:
         self.values = {'virtual_sdcard': self.sd,
                        'gcode_move': Move(), 'print_stats': self.stats,
                        'toolhead': Head(),
-                       'extruder': Obj(target=215),
+                       'extruder': Obj(target=215,
+                                       pressure_advance=.07, smooth_time=.04),
+                       'firmware_retraction': Obj(
+                           retract_length=1., retract_speed=50.,
+                           unretract_extra_length=0., unretract_speed=50.),
                        'heater_bed': Obj(target=60),
                        'fan': Obj(speed=0.7)}
     def lookup_object(self, name, default=None):
@@ -70,6 +84,42 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(state['fan_speeds'], {'fan': .7})
         self.assertEqual(state['machine_position'], [1, 2, 3, 4])
         self.assertFalse(state['gcode']['absolute_extrude'])
+        self.assertEqual(state['motion_limits'], {
+            'max_velocity': 500., 'max_accel': 20000.,
+            'square_corner_velocity': 5., 'minimum_cruise_ratio': .5,
+        })
+        self.assertEqual(state['pressure_advance'],
+                         {'advance': .07, 'smooth_time': .04})
+        self.assertEqual(state['firmware_retraction'], {
+            'retract_length': 1., 'retract_speed': 50.,
+            'unretract_extra_length': 0., 'unretract_speed': 50.,
+        })
+
+    def test_live_tuning_changes_are_reflected_in_new_checkpoint(self):
+        self.printer.values['toolhead'].limits.update(
+            max_velocity=360., max_accel=8700.,
+            square_corner_velocity=7., minimum_cruise_ratio=.2)
+        self.printer.values['extruder'].values.update(
+            pressure_advance=.095, smooth_time=.06)
+        self.printer.values['firmware_retraction'].values.update(
+            retract_length=1.4, retract_speed=31.,
+            unretract_extra_length=.2, unretract_speed=38.)
+        snapshot = self.collector.capture(2.)
+        self.assertEqual(snapshot['motion_limits']['max_accel'], 8700.)
+        self.assertEqual(snapshot['motion_limits']['minimum_cruise_ratio'], .2)
+        self.assertEqual(snapshot['pressure_advance']['advance'], .095)
+        self.assertEqual(snapshot['pressure_advance']['smooth_time'], .06)
+        self.assertEqual(snapshot['firmware_retraction']['retract_length'], 1.4)
+        self.assertEqual(snapshot['firmware_retraction']['unretract_extra_length'], .2)
+
+    def test_optional_tuning_is_omitted_when_module_missing(self):
+        self.printer.values.pop('firmware_retraction')
+        self.printer.values['extruder'].values.pop('pressure_advance')
+        self.collector.refresh_objects()
+        snapshot = self.collector.capture(1.)
+        self.assertNotIn('firmware_retraction', snapshot)
+        self.assertNotIn('pressure_advance', snapshot)
+        self.assertIn('motion_limits', snapshot)
 
     def test_paused_or_executing_skipped(self):
         self.printer.stats.state = 'paused'

@@ -63,6 +63,10 @@ class Head:
     def get_position(self):
         return [11., 22., 4., 7.]
 
+    def get_status(self, eventtime):
+        return {'max_velocity': 500., 'max_accel': 20000.,
+                'square_corner_velocity': 5., 'minimum_cruise_ratio': .5}
+
     def get_extruder(self):
         return SimpleNamespace(get_name=lambda: 'extruder')
 
@@ -90,7 +94,11 @@ class Printer:
             'gcode_move': Move(),
             'toolhead': Head(),
             'print_stats': self.stats,
-            'extruder': Obj(target=212.0),
+            'extruder': Obj(target=212.0, pressure_advance=.09,
+                            smooth_time=.04),
+            'firmware_retraction': Obj(
+                retract_length=1., retract_speed=50.,
+                unretract_extra_length=0., unretract_speed=50.),
             'heater_bed': Obj(target=63.0),
         }
 
@@ -364,6 +372,13 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual(s['file_position'], 100)
         self.assertEqual(self.module.validate_checkpoint()[0], True)
         self.assertEqual(self.module.writer.last_saved['heater_targets']['extruder'], 212.)
+        self.assertEqual(self.module.writer.last_saved['motion_limits']['max_accel'],
+                         20000.)
+        self.assertEqual(self.module.writer.last_saved['pressure_advance']['advance'],
+                         .09)
+        self.assertEqual(
+            self.module.writer.last_saved['firmware_retraction']['retract_length'],
+            1.)
         self.printer.stats.state = 'complete'
         timer(2.)
         self.wait_for(2)
