@@ -3,8 +3,7 @@ name: Sign Commits
 on:
   push:
     branches:
-      - master
-  workflow_dispatch:
+      - '**'
 
 permissions:
   contents: read
@@ -56,9 +55,41 @@ jobs:
             echo "signed=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # Explicit audit opt-in: generate assets before amending the same commit.
+      # Normal commits retain the existing signing behavior.
+      - uses: actions/setup-python@v5
+        if: steps.signature.outputs.signed == 'false' && github.ref_name == 'master' && startsWith(github.event.head_commit.message, 'docs(audit):')
+        with:
+          python-version: '3.11'
+
+      - name: Render and validate full documentation audit before signing
+        if: steps.signature.outputs.signed == 'false' && github.ref_name == 'master' && startsWith(github.event.head_commit.message, 'docs(audit):')
+        env:
+          GPIOZERO_PIN_FACTORY: mock
+          PETREL_VERIFY_PUBLISHED_SCREENS: '1'
+        run: |
+          set -euo pipefail
+          python -m pip install pyserial==3.5 websocket-client==1.9.2 Pillow==12.3.0 gpiozero==2.0.1.post3 qrcode==8.2 kconfiglib==14.1.0 pyte==0.8.2
+          python tools/render_docs_screenshots.py
+          python tools/render_print_controls.py
+          python tools/render_print_controls.py --frame
+          python tools/render_docs_workflows.py
+          python tools/render_configuration_screenshots.py
+          python -m unittest discover -s tests -p test_maintenance_published_docs.py -v
+          python -m unittest discover -s tests -p test_print_controls_documentation.py -v
+          python -m unittest discover -s tests -p test_boot_artwork.py -v
+          python -m unittest discover -s tests -p test_reload_icons.py -v
+          python tools/check_documentation.py
+          git add -A -- docs/assets/ docs/screenshots.md docs/screenshots_TR.md
+
       - name: Sign commit
         if: steps.signature.outputs.signed == 'false'
         shell: bash
         run: |
-          git commit --amend --no-edit -S
-          git push --force-with-lease origin HEAD:master
+          if [ "${{ github.ref_name }}" = "fix/audit-plan-completion" ]; then
+            git fetch --unshallow origin
+            git rebase --exec 'if ! git cat-file commit HEAD | grep -q "^gpgsig "; then git commit --amend --no-edit -S; fi' 4636e432a2f0f1fbb68b356fd66b3e51fb08a593
+          else
+            git commit --amend --no-edit -S
+          fi
+          git push --force-with-lease origin HEAD:"${{ github.ref_name }}"
