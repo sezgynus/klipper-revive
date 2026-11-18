@@ -10,6 +10,20 @@ from .klipper_revive_collect import StateCollector
 from .klipper_revive_store import CheckpointStore, CheckpointWriter
 from .klipper_revive_recovery import RecoverySession, RecoveryError
 
+class _ReviveCommandStatus:
+    """Expose a native Revive G-code command as a discoverable macro object.
+
+    Klipper webhooks lists printer objects implementing get_status(), and
+    Mainsail discovers macro actions under the 'gcode_macro ' namespace.
+    This object only advertises the existing native command: dispatch and
+    validation continue through its original G-code handler.
+    """
+
+    def get_status(self, eventtime):
+        return {}
+
+
+
 
 class KlipperRevive:
     def __init__(self, config):
@@ -42,20 +56,40 @@ class KlipperRevive:
             z_speed=config.getfloat('recovery_z_speed', 2., above=0.),
             max_xy_adjust=config.getfloat('max_xy_adjust', 5., above=0.),
             max_z_adjust=config.getfloat('max_z_adjust', 2., above=0.))
-        self.gcode.register_command('KLIPPER_REVIVE_RECOVER', self.cmd_recover,
-                                    desc='Begin attended heated XY/Z recovery')
-        self.gcode.register_command('KLIPPER_REVIVE_XY_ADJUST', self.cmd_xy_adjust)
-        self.gcode.register_command('KLIPPER_REVIVE_CONFIRM_XY', self.cmd_confirm_xy)
-        self.gcode.register_command('KLIPPER_REVIVE_Z_ADJUST', self.cmd_z_adjust)
-        self.gcode.register_command('KLIPPER_REVIVE_CONFIRM_Z', self.cmd_confirm_z)
-        self.gcode.register_command('KLIPPER_REVIVE_RESUME', self.cmd_resume)
-        self.gcode.register_command('KLIPPER_REVIVE_CANCEL', self.cmd_cancel)
-        self.gcode.register_command('KLIPPER_REVIVE_STATUS', self.cmd_status,
-                                    desc='Show Klipper Revive checkpoint status')
-        self.gcode.register_command('KLIPPER_REVIVE_INSPECT', self.cmd_inspect,
-                                    desc='Inspect last saved recovery checkpoint')
-        self.gcode.register_command('KLIPPER_REVIVE_VALIDATE', self.cmd_validate,
-                                    desc='Validate last saved checkpoint and G-code file')
+        # Keep commands native; advertise lightweight status-only objects
+        # so Mainsail can discover them without user-authored gcode_macro CFGs.
+        commands = (
+            ('KLIPPER_REVIVE_RECOVER', self.cmd_recover,
+             'Begin attended heated XY/Z recovery'),
+            ('KLIPPER_REVIVE_XY_ADJUST', self.cmd_xy_adjust,
+             'Adjust XY position during supervised recovery'),
+            ('KLIPPER_REVIVE_CONFIRM_XY', self.cmd_confirm_xy,
+             'Confirm XY alignment'),
+            ('KLIPPER_REVIVE_Z_ADJUST', self.cmd_z_adjust,
+             'Adjust Z position during supervised recovery'),
+            ('KLIPPER_REVIVE_CONFIRM_Z', self.cmd_confirm_z,
+             'Confirm Z alignment'),
+            ('KLIPPER_REVIVE_RESUME', self.cmd_resume,
+             'Resume after verifying external filament/MMU state'),
+            ('KLIPPER_REVIVE_CANCEL', self.cmd_cancel,
+             'Cancel the recovery wizard'),
+            ('KLIPPER_REVIVE_STATUS', self.cmd_status,
+             'Show Klipper Revive checkpoint status'),
+            ('KLIPPER_REVIVE_INSPECT', self.cmd_inspect,
+             'Inspect last saved recovery checkpoint'),
+            ('KLIPPER_REVIVE_VALIDATE', self.cmd_validate,
+             'Validate last saved checkpoint and G-code file'),
+        )
+        for name, handler, description in commands:
+            self.gcode.register_command(name, handler, desc=description)
+            object_name = 'gcode_macro ' + name
+            existing = self.printer.lookup_object(object_name, None)
+            if existing is None:
+                self.printer.add_object(object_name, _ReviveCommandStatus())
+            elif not isinstance(existing, _ReviveCommandStatus):
+                raise config.error(
+                    "Klipper Revive command object conflicts with '%s'"
+                    % (object_name,))
         # VirtualSD emits this immediately when loading/selecting a file,
         # before the new print has processed any G-code.
         self.printer.register_event_handler('virtual_sdcard:reset_file',

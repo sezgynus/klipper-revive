@@ -108,6 +108,11 @@ class Printer:
     def lookup_object(self, name, default=None):
         return self.objects.get(name, default)
 
+    def add_object(self, name, obj):
+        if name in self.objects:
+            raise ValueError("Duplicate Klipper object: " + name)
+        self.objects[name] = obj
+
     def lookup_objects(self):
         return list(self.objects.items())
 
@@ -434,6 +439,32 @@ class SmokeTest(unittest.TestCase):
         self.assertIsNot(self.printer.gcode.run_script, wrapper)
         self.assertIsNone(self.module._sd_dispatch_wrapper)
         self.assertFalse(self.module.enabled)
+
+    def test_native_recovery_commands_appear_as_macro_status_objects(self):
+        names = (
+            'KLIPPER_REVIVE_RECOVER', 'KLIPPER_REVIVE_XY_ADJUST',
+            'KLIPPER_REVIVE_CONFIRM_XY', 'KLIPPER_REVIVE_Z_ADJUST',
+            'KLIPPER_REVIVE_CONFIRM_Z', 'KLIPPER_REVIVE_RESUME',
+            'KLIPPER_REVIVE_CANCEL', 'KLIPPER_REVIVE_STATUS',
+            'KLIPPER_REVIVE_INSPECT', 'KLIPPER_REVIVE_VALIDATE',
+        )
+        # Klipper webhooks discovers any printer object with get_status().
+        advertised = [name for name, obj in self.printer.lookup_objects()
+                      if name.startswith('gcode_macro KLIPPER_REVIVE_')
+                      and hasattr(obj, 'get_status')]
+        self.assertEqual(set(advertised),
+                         {'gcode_macro ' + name for name in names})
+        for name in names:
+            self.assertIn(name, self.printer.gcode.commands)
+            self.assertEqual(
+                self.printer.objects['gcode_macro ' + name].get_status(0.),
+                {})
+        # Native command callbacks remain unchanged and no recovery motion
+        # is performed merely by advertising the discovery objects.
+        self.assertIs(
+            self.printer.gcode.commands['KLIPPER_REVIVE_RECOVER'].__self__,
+            self.module)
+        self.assertEqual(self.module.recovery.phase, 'inactive')
 
     def test_recovery_commands_registered_without_motion(self):
         commands = self.printer.gcode.commands

@@ -2,6 +2,23 @@
 
 **Klipper Revive** is a Klipper extension under development for recovering interrupted prints. This milestone provides automatic installation, low-overhead checkpointing, and **experimental, attended recovery** on Cartesian and CoreXY printers. A user must explicitly initiate and confirm every alignment stage. Never leave a recovery unattended.
 
+## Mainsail macro list and bookmarks
+
+Revive's native `KLIPPER_REVIVE_*` G-code commands are also advertised as
+lightweight `gcode_macro <command>` status objects. Mainsail discovers them
+in its macro list and lets you bookmark them without manually adding
+`[gcode_macro]` sections to `printer.cfg` or another configuration file.
+The underlying commands remain native Python handlers; these discovery
+objects do not execute or wrap G-code and do not save variables.
+
+**Safety:** `KLIPPER_REVIVE_RESUME` still requires an explicit
+`EXTERNAL_STATE_OK=1` argument and confirmed XY/Z alignment. Simply
+clicking its parameterless macro button cannot bypass this safeguard.
+Adjustment commands also require their respective X/Y/Z arguments.
+The safe no-argument actions include STATUS, INSPECT, VALIDATE, RECOVER,
+CONFIRM_XY, CONFIRM_Z and CANCEL (subject to each command's recovery phase
+checks). Restart Klipper after updating to refresh the macro list.
+
 ## Install (standard MainsailOS / Fluidd / KIAUH layout)
 
 Run as your normal printer user over SSH (not root):
