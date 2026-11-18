@@ -31,8 +31,14 @@ class RecoveryWizard:
         return ' '.join(raw.replace('|', '/').split())[:160]
 
     def _emit(self, kind, value=''):
+        # Buttons use the pipe character as a protocol delimiter. Sanitize
+        # only user-supplied display text, never the command/button framing.
+        if kind in ('button', 'footer_button'):
+            payload = str(value).replace('\r', ' ').replace('\n', ' ')
+        else:
+            payload = self._clean(value)
         self.gcode.respond_raw('// action:prompt_' + kind
-                               + (' ' + self._clean(value) if value else ''))
+                               + (' ' + payload if payload else ''))
 
     def _button(self, label, action, color=''):
         text = '%s|KLIPPER_REVIVE_UI ACTION=%s' % (label, action)
@@ -229,7 +235,10 @@ class RecoveryWizard:
             return
         phase = self.recovery.phase
         if phase == 'inactive':
-            self._render_preflight()
+            if self.page == 'safety':
+                self._render_safety()
+            else:
+                self._render_preflight()
         elif phase == 'align_xy':
             self._render_xy()
         elif phase == 'align_z':
@@ -291,8 +300,6 @@ class RecoveryWizard:
             self._button('Continue to safety check', 'CHECK_SAFETY', 'primary')
         self._footer('Close', 'CLOSE')
         self._show()
-        if self.page == 'safety':
-            self._render_safety()
 
     def _render_safety(self):
         self._begin('Physical safety (2/6)', [

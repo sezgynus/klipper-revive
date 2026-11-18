@@ -102,7 +102,10 @@ class WizardTests(unittest.TestCase):
         self.assertIn('action:prompt_begin Klipper Revive - Checkpoint (1/6)', output)
         self.assertIn('cube.gcode', output)
         self.assertIn('60.0%', output)
-        self.assertIn('action:prompt_button Continue to safety check|', output)
+        self.assertIn(
+            'action:prompt_button Continue to safety check|KLIPPER_REVIVE_UI ACTION=CHECK_SAFETY|primary',
+            output)
+        self.assertIn('action:prompt_footer_button Close|KLIPPER_REVIVE_UI ACTION=CLOSE', output)
         with self.assertRaisesRegex(RuntimeError, 'Confirm the physical'):
             self.action('BEGIN')
         self.action('REFRESH')
