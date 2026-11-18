@@ -19,6 +19,45 @@ The safe no-argument actions include STATUS, INSPECT, VALIDATE, RECOVER,
 CONFIRM_XY, CONFIRM_Z and CANCEL (subject to each command's recovery phase
 checks). Restart Klipper after updating to refresh the macro list.
 
+## Guided recovery wizard (Mainsail Macro Prompts)
+
+Use **`KLIPPER_REVIVE_WIZARD`** from the Mainsail macro list (or the
+console). There is no extra user-created `[gcode_macro]`, Mainsail
+modification, or frontend plugin. Revive sends the supported Macro Prompt
+commands directly through Klipper's G-code output channel. This UI requires
+Mainsail 2.9.0 or newer; the original console commands remain available in
+all clients. A client that does not implement Macro Prompts ignores the
+visual prompts but can still use the native commands.
+
+The supervised steps are:
+
+1. Display and validate the saved file/checkpoint, byte progress, machine
+   position, heater targets and stored bed mesh.
+2. Ask the operator to verify the Z axis and physical print did not shift.
+   Only then can the user click **Begin** for heating, safe Z lift and XY home.
+3. Adjust X/Y at selectable 0.05, 0.1 or 0.5 mm steps, with existing
+   configured cumulative limits. Confirm XY to lower to saved Z.
+4. Adjust Z at selectable 0.02, 0.05 or 0.1 mm steps, with existing limits.
+   Confirm Z.
+5. Require an explicit manual check of loaded filament and external MMU
+   state. Revive cannot restore Happy Hare's private tool/gate state.
+6. Choose a conservative 10%, 25% or 50% initial feedrate to resume.
+
+Buttons issue the existing, unmodified `KLIPPER_REVIVE_*` G-code
+commands through the wizard dispatcher, so the native validation and
+recovery safety gates remain authoritative. **Closing the popup does not
+cancel or undo a recovery**: reopen with `KLIPPER_REVIVE_WIZARD` at any
+time. Cancel requires separate confirmation, stops the recovery and means
+Klipper must be RESTARTed before normal homing (temporary Z reference).
+
+The UI has no continuous polling or checkpoint-write overhead. On each
+button press it reconstructs the prompt using current recovery state.
+Input values (e.g. file names) are displayed as plain sanitized text,
+and only predefined step/speed values are accepted through wizard buttons.
+Klipper's manual `KLIPPER_REVIVE_RESUME EXTERNAL_STATE_OK=1` remains
+available for console use, but the wizard never issues that acknowledgment
+until the operator explicitly confirms filament/MMU state.
+
 ## Install (standard MainsailOS / Fluidd / KIAUH layout)
 
 Run as your normal printer user over SSH (not root):
@@ -36,7 +75,7 @@ curl -fsSL https://raw.githubusercontent.com/sezgynus/klipper-revive/master/inst
 
 The installer:
 
-1. Links four Python modules (`klipper_revive.py`, `klipper_revive_collect.py`, `klipper_revive_store.py`, `klipper_revive_recovery.py`) into Klipper's `klippy/extras` directory (no copies).
+1. Links five Python modules (`klipper_revive.py`, `klipper_revive_collect.py`, `klipper_revive_store.py`, `klipper_revive_recovery.py`, `klipper_revive_ui.py`) into Klipper's `klippy/extras` directory (no copies).
 2. Creates a managed `klipper_revive.cfg` alongside `printer.cfg` containing `[klipper_revive]`.
 3. Adds `[include klipper_revive.cfg]` to `printer.cfg` **before Klipper's auto-generated `SAVE_CONFIG` block**. Re-running the installer repairs older installations that incorrectly placed the include below the block, without deleting stored probe calibration values.
 4. Creates a managed `klipper_revive_update.cfg` alongside `moonraker.conf`.

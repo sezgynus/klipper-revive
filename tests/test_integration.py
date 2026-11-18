@@ -445,7 +445,8 @@ class SmokeTest(unittest.TestCase):
             'KLIPPER_REVIVE_RECOVER', 'KLIPPER_REVIVE_XY_ADJUST',
             'KLIPPER_REVIVE_CONFIRM_XY', 'KLIPPER_REVIVE_Z_ADJUST',
             'KLIPPER_REVIVE_CONFIRM_Z', 'KLIPPER_REVIVE_RESUME',
-            'KLIPPER_REVIVE_CANCEL', 'KLIPPER_REVIVE_STATUS',
+            'KLIPPER_REVIVE_CANCEL', 'KLIPPER_REVIVE_WIZARD',
+            'KLIPPER_REVIVE_STATUS',
             'KLIPPER_REVIVE_INSPECT', 'KLIPPER_REVIVE_VALIDATE',
         )
         # Klipper webhooks discovers any printer object with get_status().
@@ -454,6 +455,8 @@ class SmokeTest(unittest.TestCase):
                       and hasattr(obj, 'get_status')]
         self.assertEqual(set(advertised),
                          {'gcode_macro ' + name for name in names})
+        self.assertIn('KLIPPER_REVIVE_UI', self.printer.gcode.commands)
+        self.assertNotIn('gcode_macro KLIPPER_REVIVE_UI', self.printer.objects)
         for name in names:
             self.assertIn(name, self.printer.gcode.commands)
             self.assertEqual(

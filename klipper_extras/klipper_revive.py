@@ -9,6 +9,7 @@ import uuid
 from .klipper_revive_collect import StateCollector
 from .klipper_revive_store import CheckpointStore, CheckpointWriter
 from .klipper_revive_recovery import RecoverySession, RecoveryError
+from .klipper_revive_ui import RecoveryWizard
 
 class _ReviveCommandStatus:
     """Expose a native Revive G-code command as a discoverable macro object.
@@ -56,9 +57,12 @@ class KlipperRevive:
             z_speed=config.getfloat('recovery_z_speed', 2., above=0.),
             max_xy_adjust=config.getfloat('max_xy_adjust', 5., above=0.),
             max_z_adjust=config.getfloat('max_z_adjust', 2., above=0.))
+        self.wizard = RecoveryWizard(self)
         # Keep commands native; advertise lightweight status-only objects
         # so Mainsail can discover them without user-authored gcode_macro CFGs.
         commands = (
+            ('KLIPPER_REVIVE_WIZARD', self.wizard.cmd_open,
+             'Open attended recovery wizard in Mainsail'),
             ('KLIPPER_REVIVE_RECOVER', self.cmd_recover,
              'Begin attended heated XY/Z recovery'),
             ('KLIPPER_REVIVE_XY_ADJUST', self.cmd_xy_adjust,
@@ -90,6 +94,10 @@ class KlipperRevive:
                 raise config.error(
                     "Klipper Revive command object conflicts with '%s'"
                     % (object_name,))
+        # Internal button dispatcher is intentionally not advertised as a
+        # visible macro; all user-facing actions are exposed by WIZARD.
+        self.gcode.register_command('KLIPPER_REVIVE_UI',
+                                    self.wizard.cmd_action)
         # VirtualSD emits this immediately when loading/selecting a file,
         # before the new print has processed any G-code.
         self.printer.register_event_handler('virtual_sdcard:reset_file',
@@ -108,6 +116,7 @@ class KlipperRevive:
             self.enabled = False
 
     def _on_stop(self):
+        self.wizard.reset()
         self.enabled = False
         self.recovery.live_adjustments_enabled = False
         self._remove_sd_completion_hook()
@@ -135,6 +144,8 @@ class KlipperRevive:
             # Revive reselects the *same* interrupted job before M26/M24.
             # Do not tombstone the checkpoint during its internal file load.
             return
+        # Any open wizard belongs to the previous interrupted job.
+        self.wizard.reset(close_prompt=True)
         # A manually selected new print must not inherit Revive live offsets.
         self.recovery.live_adjustments_enabled = False
         # SDCARD_PRINT_FILE, M23 and SDCARD_RESET_FILE reset VirtualSD.
